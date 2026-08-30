@@ -9,6 +9,7 @@ import { join, resolve, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
 import * as chart from "./chart.js";
 import * as data from "./data.js";
+import { summarise } from "./derived-indicators.js";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const PROJECT_ROOT = resolve(__dirname, "../../");
@@ -74,11 +75,23 @@ export async function runBrief({ rules_path } = {}) {
         data.getQuote({}),
       ]);
 
+      // The two on-chart LuxAlgo studies are only half the picture: the rest of
+      // the bias criteria (Stochastic, ATR, FVG, volume profile) can't fit on a
+      // Basic-plan chart, so compute them from the bars instead.
+      let derived = null;
+      try {
+        const { bars } = await data.getOhlcv({ count: 300 });
+        if (bars && bars.length >= 30) derived = summarise(bars);
+      } catch (err) {
+        derived = { error: err.message };
+      }
+
       results.push({
         symbol,
         timeframe: default_timeframe,
         state,
         indicators,
+        derived_indicators: derived,
         quote,
       });
     } catch (err) {
@@ -106,7 +119,15 @@ export async function runBrief({ rules_path } = {}) {
     },
     symbols_scanned: results,
     instruction: [
-      "For each symbol in symbols_scanned, apply the bias_criteria from rules to the indicator readings.",
+      "For each symbol in symbols_scanned, apply the bias_criteria from rules to BOTH `indicators`",
+      "(the on-chart studies) and `derived_indicators` (Stochastic, ATR, Fair Value Gaps, volume profile",
+      "computed from the bars). All the bias criteria depend on the two together.",
+      "If `derived_indicators.stale` is true the newest bar is hours old and the market is closed —",
+      "say so up front and present the readings as a snapshot of the last close, not live conditions.",
+      "Smart Money Concepts exposes only `PlotCandle` here, which is just the bar close, NOT a signal;",
+      "its real output must be read with the pine tools, so state plainly that the SMC criterion is",
+      "unevaluated rather than guessing it.",
+      "Name any criterion you could not evaluate instead of silently dropping it.",
       "Output one line per symbol: SYMBOL | BIAS: [bullish/bearish/neutral] | KEY LEVEL: [price] | WATCH: [what to monitor]",
       "End with a one-sentence overall market read.",
       "Be direct. No preamble.",
