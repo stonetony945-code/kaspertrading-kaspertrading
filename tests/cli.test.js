@@ -17,6 +17,12 @@ function require_fs() { return { writeFileSync, unlinkSync }; }
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const CLI = join(__dirname, '..', 'src', 'cli', 'index.js');
 
+// Name the CLI prints in its usage banner. Kept in one place so a rename does
+// not strand assertions: these tests asserted `tv`, the name used by the
+// upstream project this was forked from, while the CLI has long printed
+// `kasper` — so they failed on a clean clone regardless of platform.
+const CLI_NAME = 'kasper';
+
 function run(args, opts = {}) {
   try {
     const stdout = execFileSync('node', [CLI, ...args], {
@@ -38,7 +44,7 @@ describe('CLI — help and routing', () => {
   it('--help shows command list', () => {
     const { stdout, exitCode } = run(['--help']);
     assert.equal(exitCode, 0);
-    assert.ok(stdout.includes('Usage: tv'));
+    assert.ok(stdout.includes(`Usage: ${CLI_NAME}`));
     assert.ok(stdout.includes('status'));
     assert.ok(stdout.includes('pine'));
     assert.ok(stdout.includes('quote'));
@@ -47,13 +53,13 @@ describe('CLI — help and routing', () => {
   it('-h is same as --help', () => {
     const { stdout, exitCode } = run(['-h']);
     assert.equal(exitCode, 0);
-    assert.ok(stdout.includes('Usage: tv'));
+    assert.ok(stdout.includes(`Usage: ${CLI_NAME}`));
   });
 
   it('no args shows help', () => {
     const { stdout, exitCode } = run([]);
     assert.equal(exitCode, 0);
-    assert.ok(stdout.includes('Usage: tv'));
+    assert.ok(stdout.includes(`Usage: ${CLI_NAME}`));
   });
 
   it('unknown command exits 1', () => {
