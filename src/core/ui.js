@@ -44,19 +44,39 @@ export async function openPanel({ panel, action }) {
         if (panel === 'pine-editor') { var monacoEl = document.querySelector('.monaco-editor.pine-editor-monaco'); isOpen = isOpen && !!monacoEl; }
         if (panel === 'strategy-tester') { var stratPanel = document.querySelector('[data-name="backtesting"]') || document.querySelector('[class*="strategyReport"]'); isOpen = isOpen && !!(stratPanel && stratPanel.offsetParent); }
         var performed = 'none';
+        var method = null;
         if (action === 'open' || (action === 'toggle' && !isOpen)) {
           if (panel === 'pine-editor') { if (typeof bwb.activateScriptEditorTab === 'function') bwb.activateScriptEditorTab(); else if (typeof bwb.showWidget === 'function') bwb.showWidget(widgetName); }
           else { if (typeof bwb.showWidget === 'function') bwb.showWidget(widgetName); }
           performed = 'opened';
         } else if (action === 'close' || (action === 'toggle' && isOpen)) {
-          if (typeof bwb.hideWidget === 'function') bwb.hideWidget(widgetName);
+          // TradingView 3.4 dropped bottomWidgetBar.hideWidget. Guarding the call
+          // without checking the outcome made close() a silent no-op that still
+          // reported success, so try each known API and say which one ran.
+          var active = null;
+          try { active = typeof bwb.activeWidgetName === 'function' ? bwb.activeWidgetName() : null; } catch (e) {}
+          if (typeof bwb.hideWidget === 'function') {
+            bwb.hideWidget(widgetName);
+            method = 'hideWidget';
+          } else if (typeof bwb.toggleWidget === 'function' && active === widgetName) {
+            // Only safe while this widget is the active one — otherwise toggling
+            // would bring it up rather than dismiss it.
+            bwb.toggleWidget(widgetName);
+            method = 'toggleWidget';
+          } else if (typeof bwb.close === 'function') {
+            bwb.close();
+            method = 'close';
+          }
+          if (!method) {
+            return { error: 'No supported way to close the bottom panel on this TradingView build (tried hideWidget, toggleWidget, close).' };
+          }
           performed = 'closed';
         }
-        return { was_open: isOpen, performed: performed };
+        return { was_open: isOpen, performed: performed, method: method };
       })()
     `);
     if (result && result.error) throw new Error(result.error);
-    return { success: true, panel, action, was_open: result?.was_open ?? false, performed: result?.performed ?? 'unknown' };
+    return { success: true, panel, action, was_open: result?.was_open ?? false, performed: result?.performed ?? 'unknown', method: result?.method ?? null };
   } else {
     const selectorMap = {
       'watchlist': { dataName: 'base-watchlist-widget-button', ariaLabel: 'Watchlist' },
