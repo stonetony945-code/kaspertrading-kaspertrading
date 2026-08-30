@@ -140,14 +140,15 @@ describe('TradingView MCP — Full E2E (70 tools)', () => {
     });
 
     it('tv_launch — auto-detect binary (verify path resolution only)', async () => {
-      // tv_launch is destructive (kills TradingView), so we only test path detection
+      // tv_launch is destructive (kills TradingView), so we exercise only the
+      // detection half. Call the real resolver rather than re-listing paths here,
+      // so the test cannot drift from the platforms launch() actually supports.
       const { existsSync } = await import('fs');
-      const paths = [
-        '/Applications/TradingView.app/Contents/MacOS/TradingView',
-        `${process.env.HOME}/Applications/TradingView.app/Contents/MacOS/TradingView`,
-      ];
-      const found = paths.some(p => existsSync(p));
-      assert.ok(found, 'TradingView binary found on disk');
+      const { resolveTradingViewPath } = await import('../src/core/health.js');
+
+      const { tvPath, candidates } = resolveTradingViewPath();
+      assert.ok(tvPath, `TradingView binary not found on ${process.platform}. Searched: ${candidates.join(', ')}`);
+      assert.ok(existsSync(tvPath), `Resolved path does not exist: ${tvPath}`);
     });
   });
 

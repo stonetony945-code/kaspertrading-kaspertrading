@@ -159,11 +159,14 @@ export async function uiState() {
   return { success: true, ...state };
 }
 
-export async function launch({ port, kill_existing } = {}) {
-  const cdpPort = port || 9222;
-  const killFirst = kill_existing !== false;
-  const platform = process.platform;
-
+/**
+ * Resolve the TradingView binary for the given platform, without launching it.
+ * Exported so tests can verify detection without going through launch(), which
+ * kills the running instance.
+ *
+ * @returns {{ tvPath: string|null, candidates: string[] }}
+ */
+export function resolveTradingViewPath(platform = process.platform) {
   const pathMap = {
     darwin: [
       '/Applications/TradingView.app/Contents/MacOS/TradingView',
@@ -183,8 +186,9 @@ export async function launch({ port, kill_existing } = {}) {
     ],
   };
 
-  let tvPath = null;
   const candidates = pathMap[platform] || pathMap.linux;
+
+  let tvPath = null;
   for (const p of candidates) {
     if (p && existsSync(p)) { tvPath = p; break; }
   }
@@ -194,6 +198,21 @@ export async function launch({ port, kill_existing } = {}) {
       const cmd = platform === 'win32' ? 'where TradingView.exe' : 'which tradingview';
       tvPath = execSync(cmd, { timeout: 3000 }).toString().trim().split('\n')[0];
       if (tvPath && !existsSync(tvPath)) tvPath = null;
+    } catch { /* ignore */ }
+  }
+
+  // Microsoft Store (MSIX) installs live under a versioned WindowsApps path that
+  // changes on every update, so resolve it from the package manifest instead.
+  if (!tvPath && platform === 'win32') {
+    try {
+      const loc = execSync(
+        'powershell -NoProfile -NonInteractive -Command "Get-AppxPackage -Name TradingView* | Select-Object -First 1 -ExpandProperty InstallLocation"',
+        { timeout: 10000 }
+      ).toString().trim();
+      if (loc) {
+        const candidate = `${loc}\\TradingView.exe`;
+        if (existsSync(candidate)) tvPath = candidate;
+      }
     } catch { /* ignore */ }
   }
 
@@ -207,8 +226,19 @@ export async function launch({ port, kill_existing } = {}) {
     } catch { /* ignore */ }
   }
 
+  return { tvPath, candidates };
+}
+
+export async function launch({ port, kill_existing } = {}) {
+  const cdpPort = port || 9222;
+  const killFirst = kill_existing !== false;
+  const platform = process.platform;
+
+  const { tvPath, candidates } = resolveTradingViewPath(platform);
+
   if (!tvPath) {
-    throw new Error(`TradingView not found on ${platform}. Searched: ${candidates.join(', ')}. Launch manually with: /path/to/TradingView --remote-debugging-port=${cdpPort}`);
+    const alsoSearched = platform === 'win32' ? ', plus Microsoft Store (MSIX) packages' : '';
+    throw new Error(`TradingView not found on ${platform}. Searched: ${candidates.join(', ')}${alsoSearched}. Launch manually with: /path/to/TradingView --remote-debugging-port=${cdpPort}`);
   }
 
   if (killFirst) {
