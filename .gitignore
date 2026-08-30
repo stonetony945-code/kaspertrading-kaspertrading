@@ -8,3 +8,6 @@ discovery-log.json
 # Personal trading rules: watchlist, account size and risk limits.
 # Start from rules.example.json — see SETUP_GUIDE.md step 2.
 rules.json
+
+# Market snapshots written by scripts/snapshot.js — generated artefacts.
+snapshots/
