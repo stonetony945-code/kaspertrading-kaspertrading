@@ -59,6 +59,40 @@ function wv(path) {
 /** Sleep for ms */
 const sleep = (ms) => new Promise(r => setTimeout(r, ms));
 
+/**
+ * Whether bar replay can actually run at the chart's current resolution.
+ *
+ * Intraday replay is a paid TradingView feature, and the replay API does not
+ * say so: on a free plan isReplayAvailable() and isReadyToPlay() both return
+ * true, replayResolutions() lists every intraday interval, and the block only
+ * appears as an upgrade dialog once replay is started. Reading the account is
+ * the only way to tell beforehand, so the suite can skip a limitation of the
+ * plan instead of reporting it as a defect.
+ *
+ * Returns true when the plan is unknown: better to fail loudly than to skip
+ * everything silently if these internals change.
+ */
+async function replayAllowedHere() {
+  const resolution = String(await evaluate(`window.TradingViewApi.activeChart().resolution()`));
+  const isIntraday = /^\d+[TS]?$/i.test(resolution); // "1", "15", "240", "1T", "1S"
+  if (!isIntraday) return { allowed: true };         // daily and above are free
+
+  const paid = await evaluate(`
+    (function() {
+      var u = window.user || (window.TradingView && window.TradingView.user);
+      if (!u) return null;
+      if (u.pro_plan || u.is_pro === true || u.is_lite_plan === true) return true;
+      if (u.had_pro === false) return false;
+      return null;
+    })()
+  `);
+
+  if (paid === false) {
+    return { allowed: false, reason: `intraday replay (${resolution}) requires a paid TradingView plan` };
+  }
+  return { allowed: true };
+}
+
 // ═══════════════════════════════════════════════════════════════════════════
 
 describe('TradingView MCP — Full E2E (70 tools)', () => {
@@ -668,7 +702,20 @@ describe('TradingView MCP — Full E2E (70 tools)', () => {
     after(async () => {
       // Restore editor state
       if (!editorWasOpen) {
-        await evaluate(`try { ${BOTTOM_BAR}.hideWidget('pine-editor'); } catch(e) {}`);
+        // hideWidget is gone on TradingView 3.4, so this restore silently did
+        // nothing and left the editor open for every later test.
+        await evaluate(`
+          (function() {
+            try {
+              var b = ${BOTTOM_BAR};
+              var active = null;
+              try { active = typeof b.activeWidgetName === 'function' ? b.activeWidgetName() : null; } catch (e) {}
+              if (typeof b.hideWidget === 'function') b.hideWidget('pine-editor');
+              else if (typeof b.toggleWidget === 'function' && active === 'pine-editor') b.toggleWidget('pine-editor');
+              else if (typeof b.close === 'function') b.close();
+            } catch (e) {}
+          })()
+        `);
         await sleep(300);
       }
     });
@@ -1034,16 +1081,35 @@ val = array.get(a, 5)`;
       const bwb = await apiExists(BOTTOM_BAR);
       assert.ok(bwb, 'bottomWidgetBar exists');
 
-      // Open
+      // TradingView 3.4 dropped hideWidget. core/ui.js falls back through the
+      // APIs a build might expose, so assert at least one is present: when none
+      // is, closing silently does nothing while still reporting success.
+      const closer = await evaluate(`
+        (function() {
+          var b = ${BOTTOM_BAR};
+          if (typeof b.hideWidget === 'function') return 'hideWidget';
+          if (typeof b.toggleWidget === 'function') return 'toggleWidget';
+          if (typeof b.close === 'function') return 'close';
+          return null;
+        })()
+      `);
+      assert.ok(closer, 'bottomWidgetBar exposes some way to close the panel');
+
       await evaluate(`${BOTTOM_BAR}.showWidget('pine-editor')`);
-      await sleep(500);
-      const isOpen = await evaluate(`!!document.querySelector('.monaco-editor.pine-editor-monaco')`);
+      await sleep(800);
 
-      // Close
-      await evaluate(`${BOTTOM_BAR}.hideWidget('pine-editor')`);
-      await sleep(300);
-
-      assert.ok(typeof isOpen === 'boolean', 'Panel toggle works');
+      // Mirror the production fallback chain in core/ui.js.
+      await evaluate(`
+        (function() {
+          var b = ${BOTTOM_BAR};
+          var active = null;
+          try { active = typeof b.activeWidgetName === 'function' ? b.activeWidgetName() : null; } catch (e) {}
+          if (typeof b.hideWidget === 'function') b.hideWidget('pine-editor');
+          else if (typeof b.toggleWidget === 'function' && active === 'pine-editor') b.toggleWidget('pine-editor');
+          else if (typeof b.close === 'function') b.close();
+        })()
+      `);
+      await sleep(400);
     });
 
     it('ui_fullscreen — find fullscreen button', async () => {
@@ -1166,9 +1232,14 @@ val = array.get(a, 5)`;
       } catch {}
     });
 
-    it('replay_start — enter replay mode', async () => {
+    it('replay_start — enter replay mode', async (t) => {
       const available = await evaluate(wv(`${REPLAY_API}.isReplayAvailable()`));
-      if (!available) return; // Skip if replay not available for current symbol
+      if (!available) return t.skip('replay not available for this symbol');
+
+      // Check the plan before touching the toolbar: starting replay on a free
+      // plan pops TradingView's upgrade dialog over the user's chart.
+      const permitted = await replayAllowedHere();
+      if (!permitted.allowed) return t.skip(permitted.reason);
 
       await evaluate(`${REPLAY_API}.showReplayToolbar()`);
       await sleep(500);
