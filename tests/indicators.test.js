@@ -167,6 +167,17 @@ describe('inferDecimals', () => {
   it('never drops below 2 decimals', () => {
     assert.equal(inferDecimals([bar(10, 8, 9), bar(11, 9, 10)]), 2);
   });
+
+  it('ignores floating-point noise from live feeds', () => {
+    // A real GBPUSD bar arrived with open 1.3531199999999999 — String() reports
+    // 16 decimals for it, which would peg precision at the cap and print ATR
+    // and volume-profile levels with invented digits.
+    const noisy = [
+      bar(1.3535, 1.35248, 1.3531199999999999),
+      bar(1.35401, 1.3526, 1.35319),
+    ];
+    assert.equal(inferDecimals(noisy), 5);
+  });
 });
 
 describe('summarise', () => {

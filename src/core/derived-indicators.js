@@ -37,7 +37,10 @@ export function decimalsOfValues(values) {
   let max = 0;
   for (const v of values) {
     if (v === null || v === undefined || !Number.isFinite(v)) continue;
-    const s = String(v);
+    // Live feeds carry floating-point noise: a bar open of 1.35312 arrives as
+    // 1.3531199999999999, which String() reports as 16 decimals and would peg
+    // precision at the cap. Normalising first recovers the real tick size.
+    const s = String(parseFloat(v.toFixed(8)));
     const dot = s.indexOf('.');
     if (dot !== -1) max = Math.max(max, s.length - dot - 1);
   }
