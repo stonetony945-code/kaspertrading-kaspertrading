@@ -4,3 +4,7 @@ scripts/current.pine
 temp_*
 *.log
 discovery-log.json
+
+# Personal trading rules: watchlist, account size and risk limits.
+# Start from rules.example.json — see SETUP_GUIDE.md step 2.
+rules.json
