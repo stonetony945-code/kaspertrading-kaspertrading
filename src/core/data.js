@@ -2,6 +2,16 @@
  * Core data access logic.
  */
 import { evaluate, evaluateAsync, KNOWN_PATHS } from '../connection.js';
+import { decimalsOfValues } from './derived-indicators.js';
+import { colorFields } from './pine-color.js';
+
+/**
+ * Pine drawings are rounded before being deduplicated, so a fixed 2-decimal
+ * round does more than lose detail on forex: distinct levels collapse onto the
+ * same key and disappear from the result. Round at the instrument's own
+ * precision instead, inferred from the drawing values themselves.
+ */
+const round = (v, dp) => Number(v.toFixed(dp));
 
 const MAX_OHLCV_BARS = 500;
 const MAX_TRADES = 20;
@@ -366,11 +376,12 @@ export async function getPineLines({ study_filter, verbose } = {}) {
     const hLevels = [];
     const seen = {};
     const allLines = [];
+    const dp = decimalsOfValues(s.items.flatMap(i => [i.raw.y1, i.raw.y2]));
     for (const item of s.items) {
       const v = item.raw;
-      const y1 = v.y1 != null ? Math.round(v.y1 * 100) / 100 : null;
-      const y2 = v.y2 != null ? Math.round(v.y2 * 100) / 100 : null;
-      if (verbose) allLines.push({ id: item.id, y1, y2, x1: v.x1, x2: v.x2, horizontal: v.y1 === v.y2, style: v.st, width: v.w, color: v.ci });
+      const y1 = v.y1 != null ? round(v.y1, dp) : null;
+      const y2 = v.y2 != null ? round(v.y2, dp) : null;
+      if (verbose) allLines.push({ id: item.id, y1, y2, x1: v.x1, x2: v.x2, horizontal: v.y1 === v.y2, ...colorFields(v.ci), style: v.st, width: v.w, color: v.ci });
       if (y1 != null && v.y1 === v.y2 && !seen[y1]) { hLevels.push(y1); seen[y1] = true; }
     }
     hLevels.sort((a, b) => b - a);
@@ -388,12 +399,14 @@ export async function getPineLabels({ study_filter, max_labels, verbose } = {}) 
 
   const limit = max_labels || 50;
   const studies = raw.map(s => {
+    const dp = decimalsOfValues(s.items.map(i => i.raw.y));
     let labels = s.items.map(item => {
       const v = item.raw;
       const text = v.t || '';
-      const price = v.y != null ? Math.round(v.y * 100) / 100 : null;
-      if (verbose) return { id: item.id, text, price, x: v.x, yloc: v.yl, size: v.sz, textColor: v.tci, color: v.ci };
-      return { text, price };
+      const price = v.y != null ? round(v.y, dp) : null;
+      const dir = colorFields(v.tci, v.ci);
+      if (verbose) return { id: item.id, text, price, x: v.x, ...dir, yloc: v.yl, size: v.sz, textColor: v.tci, color: v.ci };
+      return { text, price, ...dir };
     }).filter(l => l.text || l.price != null);
     if (labels.length > limit) labels = labels.slice(-limit);
     return { name: s.name, total_labels: s.count, showing: labels.length, labels };
@@ -438,12 +451,14 @@ export async function getPineBoxes({ study_filter, verbose } = {}) {
     const zones = [];
     const seen = {};
     const allBoxes = [];
+    const dp = decimalsOfValues(s.items.flatMap(i => [i.raw.y1, i.raw.y2]));
     for (const item of s.items) {
       const v = item.raw;
-      const high = v.y1 != null && v.y2 != null ? Math.round(Math.max(v.y1, v.y2) * 100) / 100 : null;
-      const low = v.y1 != null && v.y2 != null ? Math.round(Math.min(v.y1, v.y2) * 100) / 100 : null;
-      if (verbose) allBoxes.push({ id: item.id, high, low, x1: v.x1, x2: v.x2, borderColor: v.c, bgColor: v.bc });
-      if (high != null && low != null) { const key = high + ':' + low; if (!seen[key]) { zones.push({ high, low }); seen[key] = true; } }
+      const high = v.y1 != null && v.y2 != null ? round(Math.max(v.y1, v.y2), dp) : null;
+      const low = v.y1 != null && v.y2 != null ? round(Math.min(v.y1, v.y2), dp) : null;
+      const dir = colorFields(v.bc, v.c);
+      if (verbose) allBoxes.push({ id: item.id, high, low, x1: v.x1, x2: v.x2, ...dir, borderColor: v.c, bgColor: v.bc });
+      if (high != null && low != null) { const key = high + ':' + low; if (!seen[key]) { zones.push({ high, low, ...dir }); seen[key] = true; } }
     }
     zones.sort((a, b) => b.high - a.high);
     const result = { name: s.name, total_boxes: s.count, zones };
