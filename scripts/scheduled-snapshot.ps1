@@ -26,6 +26,21 @@ function Log($msg) {
 
 Log "Demarrage de la capture programmee"
 
+# The task carries catch-up triggers so a missed 07:00 is retried within
+# minutes instead of the hours Windows may take on its own. Three triggers must
+# still produce one capture, so stop here when today's post-open capture is
+# already on disk -- otherwise each extra run would become the baseline the next
+# --compare diffs against, hiding the overnight move.
+$today = [DateTime]::UtcNow.ToString('yyyy-MM-dd')
+$alreadyDone = @(
+    Get-ChildItem -Path $logDir -Filter "$today*.json" -ErrorAction SilentlyContinue |
+        Where-Object { ($_.BaseName.Substring(11, 2) -as [int]) -ge 7 }
+)
+if ($alreadyDone.Count -gt 0) {
+    Log "Capture deja presente pour aujourd'hui ($($alreadyDone[0].Name)) - rien a faire"
+    exit 0
+}
+
 # The scheduler's environment does not inherit the interactive PATH.
 $nodeDir = 'C:\Program Files\nodejs'
 if (Test-Path (Join-Path $nodeDir 'node.exe')) { $env:Path = "$env:Path;$nodeDir" }
