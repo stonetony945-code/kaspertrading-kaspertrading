@@ -26,6 +26,10 @@ const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..');
 const DIR = join(ROOT, 'snapshots');
 const args = process.argv.slice(2);
 
+/** --session <name> tags a capture with the trading session that triggered it. */
+const sessionIdx = args.indexOf('--session');
+const SESSION = sessionIdx !== -1 ? (args[sessionIdx + 1] || null) : null;
+
 function listSnapshots() {
   if (!existsSync(DIR)) return [];
   return readdirSync(DIR).filter(f => f.endsWith('.json')).sort();
@@ -151,7 +155,7 @@ async function main() {
   let original = null;
   try { original = await chart.getState(); } catch {}
 
-  const snap = { captured_at: new Date().toISOString(), timeframe, symbols: [] };
+  const snap = { captured_at: new Date().toISOString(), session: SESSION, timeframe, symbols: [] };
   for (const symbol of watchlist) {
     try { snap.symbols.push(await captureSymbol(symbol, timeframe)); }
     catch (err) { snap.symbols.push({ symbol, error: err.message }); }
@@ -167,11 +171,14 @@ async function main() {
 
   const previous = listSnapshots();
   mkdirSync(DIR, { recursive: true });
-  const name = snap.captured_at.replace(/[:.]/g, '-') + '.json';
+  // The session goes in the filename so a capture is identifiable without
+  // opening it, and so the scheduler can tell which sessions already ran today.
+  const suffix = SESSION ? `__${SESSION}` : '';
+  const name = snap.captured_at.replace(/[:.]/g, '-') + suffix + '.json';
   writeFileSync(join(DIR, name), JSON.stringify(snap, null, 2));
 
   printDigest(snap);
-  console.log(`\n  Enregistré : snapshots/${name}`);
+  console.log(`\n  Enregistré : snapshots/${name}${SESSION ? `   (session ${SESSION})` : ''}`);
 
   if (args.includes('--compare')) {
     if (!previous.length) console.log('\n  Pas de capture antérieure à comparer.');

@@ -1,9 +1,19 @@
-# Unattended snapshot, for the Windows scheduled task.
+# Unattended snapshot for one trading session, driven by the Windows scheduler.
 #
-# Runs with no one watching, so it has to bring its own preconditions: node is
-# not on the PATH the scheduler hands us, TradingView may be closed, and a
-# freshly launched chart needs time before its API answers. Output is logged
-# rather than printed, since nobody is at the terminal.
+# Runs with no one watching, so it brings its own preconditions: node is not on
+# the PATH the scheduler hands us, TradingView may be closed, and a freshly
+# launched chart needs time before its API answers. Output is logged rather than
+# printed, since there is no terminal.
+#
+#   .\scheduled-snapshot.ps1 -Session londres
+#
+# Sessions are captured at their opens (UTC): asie 00:00, londres 07:00,
+# newyork 12:00. Each has catch-up triggers, so this must stay idempotent --
+# see the guard below.
+
+param(
+    [string]$Session = ''
+)
 
 $ErrorActionPreference = 'Stop'
 
@@ -17,27 +27,34 @@ try {
 $root = Split-Path -Parent $PSScriptRoot
 $logDir = Join-Path $root 'snapshots'
 New-Item -ItemType Directory -Force -Path $logDir | Out-Null
-$log = Join-Path $logDir ("run-" + (Get-Date -Format 'yyyy-MM-ddTHH-mm-ss') + ".log")
+$tag = if ($Session) { "-$Session" } else { '' }
+$log = Join-Path $logDir ("run-" + (Get-Date -Format 'yyyy-MM-ddTHH-mm-ss') + "$tag.log")
 
 function Log($msg) {
     $line = "[{0}] {1}" -f (Get-Date -Format 'HH:mm:ss'), $msg
     Add-Content -Path $log -Value $line -Encoding utf8
 }
 
-Log "Demarrage de la capture programmee"
+Log "Capture programmee - session '$Session'"
 
-# The task carries catch-up triggers so a missed 07:00 is retried within
-# minutes instead of the hours Windows may take on its own. Three triggers must
-# still produce one capture, so stop here when today's post-open capture is
-# already on disk -- otherwise each extra run would become the baseline the next
-# --compare diffs against, hiding the overnight move.
+# Markets are shut at the weekend; a capture then only records Friday's close
+# again and would become the baseline the next --compare diffs against.
+$dow = [DateTime]::UtcNow.DayOfWeek
+if ($dow -eq 'Saturday' -or $dow -eq 'Sunday') {
+    Log "Week-end ($dow) - aucune capture"
+    exit 0
+}
+
+# Each session carries catch-up triggers so a missed open is retried within
+# minutes rather than the hours Windows may take on its own. They must still
+# produce one capture per session: without this guard each extra run would
+# become the baseline the next --compare diffs against, hiding the move the
+# capture exists to record.
 $today = [DateTime]::UtcNow.ToString('yyyy-MM-dd')
-$alreadyDone = @(
-    Get-ChildItem -Path $logDir -Filter "$today*.json" -ErrorAction SilentlyContinue |
-        Where-Object { ($_.BaseName.Substring(11, 2) -as [int]) -ge 7 }
-)
-if ($alreadyDone.Count -gt 0) {
-    Log "Capture deja presente pour aujourd'hui ($($alreadyDone[0].Name)) - rien a faire"
+$pattern = if ($Session) { "$today*__$Session.json" } else { "$today*.json" }
+$already = @(Get-ChildItem -Path $logDir -Filter $pattern -ErrorAction SilentlyContinue)
+if ($already.Count -gt 0) {
+    Log "Session '$Session' deja capturee aujourd'hui ($($already[0].Name)) - rien a faire"
     exit 0
 }
 
@@ -55,12 +72,15 @@ try {
 
 # A chart that has just loaded rejects API calls for a while, so retry rather
 # than recording a spurious failure.
+$snapshotArgs = @((Join-Path $root 'scripts\snapshot.js'), '--compare')
+if ($Session) { $snapshotArgs += @('--session', $Session) }
+
 $ok = $false
 for ($i = 1; $i -le 4; $i++) {
     Start-Sleep -Seconds (10 * $i)
     Log "Tentative $i de capture"
     try {
-        $out = & node (Join-Path $root 'scripts\snapshot.js') '--compare' 2>&1
+        $out = & node @snapshotArgs 2>&1
         $out | ForEach-Object { Log $_ }
         if ($LASTEXITCODE -eq 0) { $ok = $true; break }
         Log "snapshot.js a rendu le code $LASTEXITCODE"
@@ -69,5 +89,4 @@ for ($i = 1; $i -le 4; $i++) {
     }
 }
 
-if ($ok) { Log "Capture reussie" } else { Log "ECHEC apres 4 tentatives" }
-Log "Journal : $log"
+if ($ok) { Log "Capture reussie (session '$Session')" } else { Log "ECHEC apres 4 tentatives" }
