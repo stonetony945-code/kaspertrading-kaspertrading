@@ -103,31 +103,41 @@ async function readSymbol(symbol, timeframe) {
 function describe(symbol, cur, verdicts) {
   const s = cur.stochastic || {};
   const a = cur.atr || {};
-  const best = verdicts.bearish.score >= verdicts.bullish.score ? verdicts.bearish : verdicts.bullish;
+  const v = cur.relative_volume || {};
+  const h = cur.higher_timeframe || {};
+  // Show the side whose filters are open: that is the direction a trigger
+  // could actually fire on right now.
+  const side = verdicts.bearish.filtersPass ? verdicts.bearish
+    : verdicts.bullish.filtersPass ? verdicts.bullish
+      : verdicts.bearish;
+  const gate = side.filtersPass
+    ? `filtres OK (${side.direction})`
+    : `bloque: ${side.blockedBy.join(',')}`;
   return `${stamp()}  ${symbol.padEnd(7)} ${String(cur.price).padEnd(11)}`
-    + ` K${s.k ?? '—'}/D${s.d ?? '—'}  ATR ${a.state ?? '—'} x${a.vs_20_period_avg ?? '—'}`
-    + `  ${best.direction} ${best.score}/${best.total}`
-    + (best.unknown ? ` (${best.unknown} inconnu)` : '');
+    + ` K${s.k ?? '—'}/D${s.d ?? '—'}`
+    + `  ATR ${a.state ?? '—'}  vol ${v.state ?? '—'}  1h ${h.direction ?? '—'}`
+    + `  ${gate}`;
 }
 
 function announce(symbol, cur, hit) {
-  const met = Object.entries(hit.criteria).filter(([, v]) => v === 'met').map(([k]) => k);
   const lines = [
     '',
-    '  ' + '='.repeat(66),
+    '  ' + '='.repeat(70),
     `  SIGNAL ${hit.direction.toUpperCase()}  ${symbol}  a ${cur.price}   ${new Date().toISOString()}`,
-    `  ${hit.score}/${hit.total} criteres : ${met.join(', ')}`,
-    `  Stochastique K ${cur.stochastic?.k} / D ${cur.stochastic?.d}`,
-    `  ATR ${cur.atr?.value} ${cur.atr?.state} x${cur.atr?.vs_20_period_avg}`,
-    '  Verifiez le chart avant toute decision — ceci signale vos regles, pas une recommandation.',
-    '  ' + '='.repeat(66),
+    `  declencheurs : structure ${hit.triggers.structure}, croisement ${hit.triggers.momentum_cross}`,
+    `  filtres      : ATR ${cur.atr?.state}, volume ${cur.relative_volume?.state} (x${cur.relative_volume?.ratio}), 1h ${cur.higher_timeframe?.direction}`,
+    `  stochastique K ${cur.stochastic?.k} / D ${cur.stochastic?.d}`,
+    '  Ceci signale VOS regles. Verifiez le chart — ce n\'est pas une recommandation.',
+    '  ' + '='.repeat(70),
     '',
   ];
   console.log(lines.join('\n'));
   logLine(`alerts-${today()}.log`, {
     at: new Date().toISOString(), session: sessionOf(), symbol,
-    direction: hit.direction, price: cur.price, score: hit.score,
-    criteria: hit.criteria, stochastic: cur.stochastic, atr: cur.atr,
+    direction: hit.direction, price: cur.price,
+    triggers: hit.triggers, filters: hit.filters,
+    stochastic: cur.stochastic, atr: cur.atr,
+    relative_volume: cur.relative_volume, higher_timeframe: cur.higher_timeframe,
   });
 }
 
@@ -144,12 +154,12 @@ async function tick(watchlist, timeframe) {
         at: new Date().toISOString(), session: sessionOf(), symbol,
         price: cur.price, stale: cur.stale === true,
         stochastic: cur.stochastic, atr: cur.atr,
+        relative_volume: cur.relative_volume, higher_timeframe: cur.higher_timeframe,
         fvg: cur.fair_value_gaps?.unfilled_total ?? null,
         price_vs_value: cur.volume_profile?.price_vs_value ?? null,
         signal_ma: ctx.signalMa, smc: ctx.smcDirection,
-        bearish: verdicts.bearish.score, bullish: verdicts.bullish.score,
-        criteria_bearish: verdicts.bearish.criteria,
-        criteria_bullish: verdicts.bullish.criteria,
+        bearish: { filters: verdicts.bearish.filters, triggers: verdicts.bearish.triggers, blockedBy: verdicts.bearish.blockedBy },
+        bullish: { filters: verdicts.bullish.filters, triggers: verdicts.bullish.triggers, blockedBy: verdicts.bullish.blockedBy },
       });
 
       if (verdicts.signal) announce(symbol, cur, verdicts.signal);

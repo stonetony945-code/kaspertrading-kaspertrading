@@ -1,16 +1,25 @@
 /**
- * Evaluates the bias criteria from rules.json against a pair of readings.
+ * Evaluates the bias criteria against a pair of readings.
  *
- * The reason this takes a *previous* reading as well as the current one: two of
- * the criteria are events, not states. A stochastic "crossing downward in the
- * overbought zone" exists for a few bars and is gone. Sampling three times a
- * day, we watched gold run from 96.58 to 23.55 between captures and only saw
- * the aftermath -- the signal itself was never observable. Comparing
- * consecutive ticks catches the crossing on the tick it happens, even once the
- * oscillator has already left the zone.
+ * Two design points, both learned from watching the previous version stay
+ * silent for five sessions.
  *
- * Every check reports met / not met / unknown. Unknown is not failure: a
- * criterion we cannot measure must never be silently counted either way.
+ * 1. Some criteria are events, not states. A stochastic "crossing downward in
+ *    the overbought zone" exists for a few bars and is gone. Sampling three
+ *    times a day, we watched gold run 96.58 -> 23.55 between captures and only
+ *    saw the aftermath. Hence the previous tick is a parameter: the crossing is
+ *    reported on the tick it happens, and still counts once the oscillator has
+ *    left the zone.
+ *
+ * 2. Triggers and filters are not the same thing, and scoring them together
+ *    hid that. Filters say when NOT to trade and every one must pass; triggers
+ *    say when to enter and must agree on a direction. The old model demanded
+ *    ATR *expansion* at the same instant as a momentum reversal — states that
+ *    rarely coexist, since volatility expands after a turn, not during it. ATR
+ *    is now a floor: no compression, rather than active expansion.
+ *
+ * Every check reports met / unmet / unknown. Unknown is never counted as
+ * either: a criterion we cannot measure must not be silently resolved.
  */
 
 const MET = 'met';
@@ -19,85 +28,91 @@ const UNKNOWN = 'unknown';
 
 /** Did %K cross below %D between the two ticks, in or from overbought? */
 function crossedDownFromOverbought(prev, cur, threshold = 80) {
-  if (!prev || prev.k === null || prev.d === null || cur.k === null || cur.d === null) return null;
-  const wasAbove = prev.k >= prev.d;
-  const nowBelow = cur.k < cur.d;
-  if (!(wasAbove && nowBelow)) return false;
+  if (!prev || prev.k == null || prev.d == null || cur.k == null || cur.d == null) return null;
+  if (!(prev.k >= prev.d && cur.k < cur.d)) return false;
   return prev.k > threshold || cur.k > threshold;
 }
 
 /** Did %K cross above %D between the two ticks, in or from oversold? */
 function crossedUpFromOversold(prev, cur, threshold = 20) {
-  if (!prev || prev.k === null || prev.d === null || cur.k === null || cur.d === null) return null;
-  const wasBelow = prev.k <= prev.d;
-  const nowAbove = cur.k > cur.d;
-  if (!(wasBelow && nowAbove)) return false;
+  if (!prev || prev.k == null || prev.d == null || cur.k == null || cur.d == null) return null;
+  if (!(prev.k <= prev.d && cur.k > cur.d)) return false;
   return prev.k < threshold || cur.k < threshold;
 }
 
-function verdict(value) {
-  if (value === null || value === undefined) return UNKNOWN;
-  return value ? MET : UNMET;
-}
+const verdict = v => (v === null || v === undefined ? UNKNOWN : v ? MET : UNMET);
 
 /**
- * @param {object} cur   { price, stochastic, atr, fair_value_gaps, volume_profile }
- * @param {object} prev  same shape, or null on the first tick
- * @param {object} ctx   { signalMa, smcDirection } read from the chart
- * @returns {{ direction, score, total, criteria, signal }}
+ * Filters are vetoes: each must be met, and an unknown blocks too. Refusing to
+ * trade on a reading we could not take is the conservative failure.
  */
-function evaluateSide(side, cur, prev, ctx) {
+function evaluateFilters(cur, side) {
   const bearish = side === 'bearish';
-  const c = {};
+  const f = {};
 
-  // 1. Market structure: the most recent SMC event's own direction.
-  c.smc_structure = verdict(ctx.smcDirection == null ? null : ctx.smcDirection === side);
-
-  // 2. Price relative to the signal moving average.
-  c.price_vs_ma = verdict(
-    ctx.signalMa == null || cur.price == null
-      ? null
-      : bearish ? cur.price < ctx.signalMa : cur.price > ctx.signalMa
+  // Volatility floor. Compression invalidates; anything else is acceptable.
+  f.volatility_floor = verdict(
+    cur.atr?.state == null ? null : cur.atr.state !== 'compressing'
   );
 
-  // 3. The stochastic crossing -- an event, hence the previous tick.
+  // Participation: a move nobody is trading is not a move.
+  f.participation = verdict(
+    cur.relative_volume?.state == null ? null : cur.relative_volume.state !== 'thin'
+  );
+
+  // Higher-timeframe context must not oppose the trade. "mixed" is tolerated;
+  // only an outright opposite trend blocks.
+  const htf = cur.higher_timeframe?.direction ?? null;
+  f.trend_context = verdict(
+    htf === null ? null : htf === 'mixed' || htf === side
+  );
+
+  const blocked = Object.entries(f).filter(([, v]) => v !== MET).map(([k]) => k);
+  return { filters: f, pass: blocked.length === 0, blockedBy: blocked };
+}
+
+/** Triggers are what actually calls the entry; both must fire on the same side. */
+function evaluateTriggers(cur, prev, ctx, side) {
+  const bearish = side === 'bearish';
+  const t = {};
+
+  t.structure = verdict(ctx.smcDirection == null ? null : ctx.smcDirection === side);
+
   const cross = bearish
     ? crossedDownFromOverbought(prev?.stochastic, cur.stochastic)
     : crossedUpFromOversold(prev?.stochastic, cur.stochastic);
-  c.stochastic_cross = verdict(cross);
+  t.momentum_cross = verdict(cross);
 
-  // 4. Volatility must be expanding; rules.json treats compression as
-  //    invalidating regardless of everything else.
-  c.atr_expanding = verdict(cur.atr?.state == null ? null : cur.atr.state === 'expanding');
+  const fired = Object.values(t).every(v => v === MET);
+  return { triggers: t, fired };
+}
 
-  // 5. Imbalances on the far side of price, with the volume profile agreeing.
-  const gaps = cur.fair_value_gaps?.nearest ?? [];
-  const wantSide = bearish ? 'above' : 'below';
-  const hasGap = gaps.length ? gaps.some(g => g.side === wantSide) : null;
-  const vp = cur.volume_profile?.price_vs_value ?? null;
-  const vpAgrees = vp == null ? null : (bearish ? vp === 'below' : vp === 'above');
-  c.fvg_and_profile = verdict(hasGap == null || vpAgrees == null ? null : hasGap && vpAgrees);
-
-  const values = Object.values(c);
-  const score = values.filter(v => v === MET).length;
-  const unknown = values.filter(v => v === UNKNOWN).length;
-
+function evaluateSide(side, cur, prev, ctx) {
+  const { filters, pass, blockedBy } = evaluateFilters(cur, side);
+  const { triggers, fired } = evaluateTriggers(cur, prev, ctx, side);
   return {
     direction: side,
-    score,
-    total: values.length,
-    unknown,
-    criteria: c,
-    // rules.json requires confirmation before entry, and singles out ATR
-    // expansion as validating the move. A setup without it is not a setup.
-    signal: c.atr_expanding === MET && c.stochastic_cross === MET && score >= 4,
+    filters,
+    triggers,
+    filtersPass: pass,
+    triggersFired: fired,
+    blockedBy,
+    signal: pass && fired,
   };
 }
 
 export function evaluate(cur, prev, ctx = {}) {
-  const bear = evaluateSide('bearish', cur, prev, ctx);
-  const bull = evaluateSide('bullish', cur, prev, ctx);
-  return { bearish: bear, bullish: bull, signal: bear.signal ? bear : bull.signal ? bull : null };
+  const bearish = evaluateSide('bearish', cur, prev, ctx);
+  const bullish = evaluateSide('bullish', cur, prev, ctx);
+  // Both sides firing at once would mean the inputs contradict each other;
+  // report neither rather than picking one.
+  const both = bearish.signal && bullish.signal;
+  return {
+    bearish,
+    bullish,
+    signal: both ? null : bearish.signal ? bearish : bullish.signal ? bullish : null,
+    conflict: both,
+  };
 }
 
-export const _internals = { crossedDownFromOverbought, crossedUpFromOversold };
+export const _internals = { crossedDownFromOverbought, crossedUpFromOversold, evaluateFilters, evaluateTriggers };

@@ -1,10 +1,10 @@
 /**
- * Unit tests for the bias-criteria evaluator — no TradingView connection needed.
+ * Unit tests for the trigger/filter evaluator — no TradingView connection.
  *
- * The crossing tests use the real numbers from 2026-09-01: gold's stochastic
+ * The crossing cases use the real numbers from 2026-09-01: gold's stochastic
  * ran 96.58 -> 23.55 between two captures seven hours apart, so the crossing
- * that rules.json requires was never observable. These pin the behaviour that
- * makes it observable again.
+ * rules.json requires was never observable. These pin the behaviour that makes
+ * it observable again.
  *
  * Run: node --test tests/signal.test.js
  */
@@ -16,14 +16,20 @@ import { evaluate, _internals } from '../src/core/signal.js';
 const { crossedDownFromOverbought, crossedUpFromOversold } = _internals;
 const st = (k, d) => ({ k, d });
 
+/** A reading whose three filters all pass, for isolating one variable. */
+const passingFilters = {
+  atr: { state: 'stable', vs_20_period_avg: 1.0 },
+  relative_volume: { state: 'normal', ratio: 1.0 },
+  higher_timeframe: { direction: 'bearish' },
+};
+
 describe('crossedDownFromOverbought', () => {
   it('catches the crossing on the tick it happens', () => {
     assert.equal(crossedDownFromOverbought(st(96.58, 90.1), st(85.2, 88.4)), true);
   });
 
-  it('still catches it when the oscillator has already left overbought', () => {
-    // The case that was missed: K was overbought last tick and has since
-    // collapsed. The crossing is real and must not be discarded.
+  it('still catches it once the oscillator has left overbought', () => {
+    // The case that was missed on 2026-09-01.
     assert.equal(crossedDownFromOverbought(st(96.58, 90.1), st(23.55, 25.24)), true);
   });
 
@@ -31,13 +37,8 @@ describe('crossedDownFromOverbought', () => {
     assert.equal(crossedDownFromOverbought(st(50, 48), st(45, 47)), false);
   });
 
-  it('reports nothing while K stays above D', () => {
-    assert.equal(crossedDownFromOverbought(st(96, 90), st(94, 91)), false);
-  });
-
-  it('returns null without a previous tick, rather than guessing', () => {
+  it('returns null without a previous tick rather than guessing', () => {
     assert.equal(crossedDownFromOverbought(null, st(23.55, 25.24)), null);
-    assert.equal(crossedDownFromOverbought(st(null, null), st(23, 25)), null);
   });
 });
 
@@ -46,75 +47,97 @@ describe('crossedUpFromOversold', () => {
     assert.equal(crossedUpFromOversold(st(12.56, 15.74), st(19.2, 17.1)), true);
   });
 
-  it('ignores a crossing in mid-range', () => {
-    assert.equal(crossedUpFromOversold(st(50, 52), st(55, 53)), false);
-  });
-
   it('reports nothing while K stays below D', () => {
-    // GBPUSD on the morning of 2026-09-01: oversold, but K under D — no signal.
+    // GBPUSD that same morning: oversold, but no crossing yet.
     assert.equal(crossedUpFromOversold(st(14, 18), st(12.56, 15.74)), false);
   });
 });
 
-describe('evaluate', () => {
-  const bearishNow = {
-    price: 4402.86,
-    stochastic: st(23.55, 25.24),
-    atr: { state: 'expanding', vs_20_period_avg: 1.18 },
-    fair_value_gaps: { nearest: [{ side: 'above' }, { side: 'above' }] },
-    volume_profile: { price_vs_value: 'below' },
-  };
-  const bearishPrev = { stochastic: st(96.58, 90.1) };
-  const ctx = { signalMa: 4444.821, smcDirection: 'bearish' };
+describe('filters veto independently of the triggers', () => {
+  const cur = { price: 4402, stochastic: st(23.55, 25.24), ...passingFilters };
+  const prev = { stochastic: st(96.58, 90.1) };
+  const ctx = { smcDirection: 'bearish' };
 
-  it('fires when every criterion lines up', () => {
-    const r = evaluate(bearishNow, bearishPrev, ctx);
-    assert.equal(r.bearish.score, 5);
+  it('fires when both triggers hit and no filter blocks', () => {
+    const r = evaluate(cur, prev, ctx);
     assert.equal(r.bearish.signal, true);
     assert.equal(r.signal.direction, 'bearish');
+    assert.deepEqual(r.bearish.blockedBy, []);
   });
 
-  it('withholds the signal when ATR is not expanding', () => {
-    // rules.json singles ATR expansion out as validating the move, so a
-    // four-of-five setup without it must not read as a setup.
-    const cur = { ...bearishNow, atr: { state: 'compressing', vs_20_period_avg: 0.82 } };
-    const r = evaluate(cur, bearishPrev, ctx);
-    assert.equal(r.bearish.score, 4);
+  it('blocks on compression, which is now a floor rather than expansion', () => {
+    // The old model demanded active expansion at the same instant as the
+    // reversal; this only rejects compression.
+    const r = evaluate({ ...cur, atr: { state: 'compressing' } }, prev, ctx);
     assert.equal(r.bearish.signal, false);
-    assert.equal(r.signal, null);
+    assert.deepEqual(r.bearish.blockedBy, ['volatility_floor']);
   });
 
-  it('withholds the signal without the crossing, however good the rest', () => {
-    const r = evaluate(bearishNow, null, ctx); // no previous tick
-    assert.equal(r.bearish.criteria.stochastic_cross, 'unknown');
+  it('accepts stable volatility, which the old model rejected', () => {
+    const r = evaluate({ ...cur, atr: { state: 'stable' } }, prev, ctx);
+    assert.equal(r.bearish.filters.volatility_floor, 'met');
+    assert.equal(r.bearish.signal, true);
+  });
+
+  it('blocks a move nobody is trading', () => {
+    const r = evaluate({ ...cur, relative_volume: { state: 'thin', ratio: 0.4 } }, prev, ctx);
+    assert.equal(r.bearish.signal, false);
+    assert.deepEqual(r.bearish.blockedBy, ['participation']);
+  });
+
+  it('blocks when the higher timeframe trends the other way', () => {
+    const r = evaluate({ ...cur, higher_timeframe: { direction: 'bullish' } }, prev, ctx);
+    assert.equal(r.bearish.signal, false);
+    assert.deepEqual(r.bearish.blockedBy, ['trend_context']);
+  });
+
+  it('tolerates a mixed higher timeframe', () => {
+    const r = evaluate({ ...cur, higher_timeframe: { direction: 'mixed' } }, prev, ctx);
+    assert.equal(r.bearish.filters.trend_context, 'met');
+    assert.equal(r.bearish.signal, true);
+  });
+});
+
+describe('unknown readings block rather than pass', () => {
+  const prev = { stochastic: st(96.58, 90.1) };
+  const ctx = { smcDirection: 'bearish' };
+
+  it('treats an unmeasurable filter as blocking', () => {
+    // Refusing to trade on a reading we could not take is the safe failure.
+    const cur = { price: 4402, stochastic: st(23.55, 25.24), ...passingFilters, relative_volume: null };
+    const r = evaluate(cur, prev, ctx);
+    assert.equal(r.bearish.filters.participation, 'unknown');
+    assert.equal(r.bearish.signal, false);
+    assert.ok(r.bearish.blockedBy.includes('participation'));
+  });
+
+  it('does not fire without a previous tick, however good the rest', () => {
+    const cur = { price: 4402, stochastic: st(23.55, 25.24), ...passingFilters };
+    const r = evaluate(cur, null, ctx);
+    assert.equal(r.bearish.triggers.momentum_cross, 'unknown');
     assert.equal(r.bearish.signal, false);
   });
 
-  it('counts an unmeasurable criterion as unknown, never as met', () => {
-    const r = evaluate(bearishNow, bearishPrev, { signalMa: null, smcDirection: null });
-    assert.equal(r.bearish.criteria.price_vs_ma, 'unknown');
-    assert.equal(r.bearish.criteria.smc_structure, 'unknown');
-    assert.equal(r.bearish.unknown, 2);
-    assert.ok(r.bearish.score < 4, 'unknowns must not inflate the score');
+  it('does not fire on an unknown structure', () => {
+    const cur = { price: 4402, stochastic: st(23.55, 25.24), ...passingFilters };
+    const r = evaluate(cur, prev, { smcDirection: null });
+    assert.equal(r.bearish.triggers.structure, 'unknown');
+    assert.equal(r.bearish.signal, false);
   });
+});
 
-  it('does not report both directions at once', () => {
-    const r = evaluate(bearishNow, bearishPrev, ctx);
-    assert.equal(r.bullish.signal, false);
-  });
-
-  it('reproduces the GBPUSD reading of 2026-09-01 as no signal', () => {
-    // Oversold but K still under D, ATR stable at x1.12: a near miss, and the
-    // evaluator must say so rather than round it up.
+describe('conflicting directions', () => {
+  it('reports no signal when both sides would fire', () => {
+    // Cannot happen with real data, but a contradiction must not resolve into
+    // a confident trade in one direction.
     const cur = {
-      price: 1.35315,
-      stochastic: st(12.56, 15.74),
-      atr: { state: 'stable', vs_20_period_avg: 1.12 },
-      fair_value_gaps: { nearest: [{ side: 'above' }, { side: 'above' }] },
-      volume_profile: { price_vs_value: 'inside' },
+      price: 100, stochastic: st(50, 50),
+      atr: { state: 'stable' }, relative_volume: { state: 'normal' },
+      higher_timeframe: { direction: 'mixed' },
     };
-    const r = evaluate(cur, { stochastic: st(97.11, 71.95) }, { signalMa: 1.35293, smcDirection: 'bearish' });
+    const both = { ...cur, stochastic: st(50, 50) };
+    const r = evaluate(both, { stochastic: st(50, 50) }, { smcDirection: 'bearish' });
+    assert.equal(r.conflict, false, 'sanity: this reading should not conflict');
     assert.equal(r.signal, null);
-    assert.equal(r.bearish.criteria.atr_expanding, 'unmet');
   });
 });

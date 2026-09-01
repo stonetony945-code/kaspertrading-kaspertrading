@@ -72,7 +72,7 @@ function stochState(k, d) {
  * `include` is a Set of: stochastic, atr, fvg, volume_profile.
  */
 export function summarise(bars, { include, options = {} } = {}) {
-  const want = include || new Set(['stochastic', 'atr', 'fvg', 'volume_profile']);
+  const want = include || new Set(['stochastic', 'atr', 'fvg', 'volume_profile', 'volume', 'htf']);
   const last = bars[bars.length - 1];
   const price = last.close;
   const dp = inferDecimals(bars);
@@ -129,6 +129,32 @@ export function summarise(bars, { include, options = {} } = {}) {
     };
   }
 
+  if (want.has('volume')) {
+    const rv = relativeVolume(bars, { period: options.volume_period || 20 });
+    out.relative_volume = rv && {
+      ratio: round(rv.ratio, 2),
+      state: rv.state,
+      volume: Math.round(rv.volume),
+      average: Math.round(rv.average),
+    };
+  }
+
+  if (want.has('htf')) {
+    const h = higherTimeframeTrend(bars, {
+      seconds: options.htf_seconds || 3600,
+      period: options.htf_period || 20,
+    });
+    out.higher_timeframe = h && {
+      timeframe: `${(options.htf_seconds || 3600) / 60}min`,
+      ema: round(h.ema, dp),
+      price: round(h.price, dp),
+      above_ema: h.above,
+      direction: h.direction,
+      bars: h.bars,
+      note: 'EMA computed from aggregated bars, not the LuxAlgo Signal MA.',
+    };
+  }
+
   if (want.has('volume_profile')) {
     const vp = volumeProfile(bars, { bins: options.vp_bins || 24 });
     out.volume_profile = vp && {
@@ -142,6 +168,104 @@ export function summarise(bars, { include, options = {} } = {}) {
   }
 
   return out;
+}
+
+/**
+ * Volume of the last completed bar against its own recent average.
+ *
+ * Answers a question none of the price-based criteria can: is this move
+ * carried, or hollow? Independent of where price sits, which is what makes it
+ * worth a criterion slot — the Sunday reopen moved prices on almost no
+ * participation, and nothing in a structure reading says so.
+ *
+ * The forming bar is excluded: it is partial by definition and always looks
+ * thin, which would veto every signal near the open of a bar.
+ */
+export function relativeVolume(bars, { period = 20 } = {}) {
+  if (bars.length < period + 2) return null;
+  const closed = bars.slice(0, -1);                 // drop the bar still forming
+  const last = closed[closed.length - 1];
+  const window = closed.slice(-1 - period, -1);
+  if (window.length < period) return null;
+  const avg = window.reduce((a, b) => a + b.volume, 0) / window.length;
+  if (!(avg > 0)) return null;
+  const ratio = last.volume / avg;
+  return {
+    volume: last.volume,
+    average: avg,
+    ratio,
+    state: ratio >= 1.2 ? 'high' : ratio <= 0.6 ? 'thin' : 'normal',
+  };
+}
+
+/**
+ * Group bars into a higher timeframe by wall-clock bucket.
+ *
+ * Bucketing on the bar's own timestamp rather than chunking every N bars keeps
+ * the candles aligned to real hour boundaries even when the feed has gaps —
+ * over a weekend, blind chunking would straddle the break and invent a candle
+ * that never traded.
+ */
+export function aggregate(bars, { seconds = 3600 } = {}) {
+  const out = [];
+  let cur = null;
+  let bucket = null;
+  for (const b of bars) {
+    const k = Math.floor(b.time / seconds);
+    if (k !== bucket) {
+      if (cur) out.push(cur);
+      bucket = k;
+      cur = { time: k * seconds, open: b.open, high: b.high, low: b.low, close: b.close, volume: b.volume };
+    } else {
+      cur.high = Math.max(cur.high, b.high);
+      cur.low = Math.min(cur.low, b.low);
+      cur.close = b.close;
+      cur.volume += b.volume;
+    }
+  }
+  if (cur) out.push(cur);
+  return out;
+}
+
+/** Exponential moving average, null-padded until the seed. */
+function emaSeries(values, n) {
+  const out = new Array(values.length).fill(null);
+  if (values.length < n) return out;
+  let sum = 0;
+  for (let i = 0; i < n; i++) sum += values[i];
+  out[n - 1] = sum / n;
+  const k = 2 / (n + 1);
+  for (let i = n; i < values.length; i++) out[i] = values[i] * k + out[i - 1] * (1 - k);
+  return out;
+}
+
+/**
+ * Trend on a higher timeframe, derived from the same bars.
+ *
+ * Built by aggregation rather than by switching the chart: re-reading at
+ * another resolution would flip the user's display and take seconds per poll.
+ * The average is our own EMA, not the LuxAlgo Signal MA — that script is
+ * closed, so this is a different measure serving the same purpose, and it is
+ * reported under its own name to avoid implying otherwise.
+ */
+export function higherTimeframeTrend(bars, { seconds = 3600, period = 20 } = {}) {
+  const htf = aggregate(bars, { seconds });
+  if (htf.length < period + 2) return null;
+  const closes = htf.map(b => b.close);
+  const ema = emaSeries(closes, period);
+  const last = ema[ema.length - 1];
+  const prev = ema[ema.length - 2];
+  if (last === null || prev === null) return null;
+  const price = closes[closes.length - 1];
+  const slope = last - prev;
+  return {
+    bars: htf.length,
+    ema: last,
+    price,
+    above: price > last,
+    slope,
+    direction: slope > 0 && price > last ? 'bullish' : slope < 0 && price < last ? 'bearish' : 'mixed',
+  };
 }
 
 /** Simple moving average over a series, preserving null-padding. */
