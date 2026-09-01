@@ -202,6 +202,19 @@ describe('summarise', () => {
     assert.equal(g.top, 1.35187);
   });
 
+  it('rounds the reported price to the instrument precision', () => {
+    // A real bar close arrived as 1.3532899999999999 and was logged verbatim.
+    // Only the reported value is rounded — the comparisons inside summarise
+    // keep the raw close.
+    const bars = [
+      bar(1.35401, 1.3526, 1.35319),
+      bar(1.35345, 1.35248, 1.35377),
+      bar(1.3535, 1.35248, 1.3532899999999999),
+    ];
+    const out = summarise(bars, { include: new Set(['fvg']) });
+    assert.equal(out.price, 1.35329);
+  });
+
   it('returns only the requested sections', () => {
     const out = summarise(fxGap, { include: new Set(['fvg']) });
     assert.ok(out.fair_value_gaps);

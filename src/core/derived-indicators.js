@@ -76,7 +76,11 @@ export function summarise(bars, { include, options = {} } = {}) {
   const last = bars[bars.length - 1];
   const price = last.close;
   const dp = inferDecimals(bars);
-  const out = { bar_count: bars.length, price, price_decimals: dp };
+  // Round price like every other level: the raw close carries floating-point
+  // noise straight from the feed, so a bar at 1.35329 was being logged as
+  // 1.3532899999999999 — harmless to the maths, but it reads as precision the
+  // instrument does not have.
+  const out = { bar_count: bars.length, price: round(price, dp), price_decimals: dp };
 
   // A brief built on stale bars reads as current unless the age is stated:
   // over a weekend or an outage the newest bar can be days old.
