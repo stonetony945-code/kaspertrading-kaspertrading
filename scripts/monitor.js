@@ -42,6 +42,9 @@ const argVal = (name, dflt) => {
 const INTERVAL_MIN = Number(argVal('--interval', '5'));
 const SWITCH = !args.includes('--no-switch');
 const ONCE = args.includes('--once');
+/** --symbols overrides the watchlist; needed when running unattended, where
+ *  "whatever is on the chart" is not something we can rely on. */
+const SYMBOLS = (argVal('--symbols', '') || '').split(',').map(s => s.trim()).filter(Boolean);
 
 const sleep = ms => new Promise(r => setTimeout(r, ms));
 const stamp = () => new Date().toISOString().slice(11, 19);
@@ -69,10 +72,20 @@ function sessionOf(d = new Date()) {
 
 async function readSymbol(symbol, timeframe) {
   if (SWITCH) {
-    await chart.setSymbol({ symbol });
-    await sleep(900);
-    await chart.setTimeframe({ timeframe });
-    await sleep(900);
+    // Only touch the chart when it is not already showing what we want: with a
+    // single symbol this makes the monitor a passive reader after the first
+    // tick, instead of re-issuing a switch every few minutes.
+    const st = await chart.getState().catch(() => null);
+    const onSymbol = st?.symbol && (st.symbol === symbol || st.symbol.endsWith(`:${symbol}`));
+    const onTimeframe = String(st?.resolution ?? '') === String(timeframe);
+    if (!onSymbol) {
+      await chart.setSymbol({ symbol });
+      await sleep(900);
+    }
+    if (!onTimeframe) {
+      await chart.setTimeframe({ timeframe });
+      await sleep(900);
+    }
   }
 
   const { bars } = await data.getOhlcv({ count: 300 });
@@ -172,8 +185,8 @@ async function tick(watchlist, timeframe) {
 async function main() {
   const rules = JSON.parse(readFileSync(join(ROOT, 'rules.json'), 'utf8'));
   const timeframe = rules.default_timeframe || '15';
-  let watchlist = rules.watchlist || [];
-  if (!SWITCH) {
+  let watchlist = SYMBOLS.length ? SYMBOLS : (rules.watchlist || []);
+  if (!SWITCH && !SYMBOLS.length) {
     const st = await chart.getState();
     watchlist = [st.symbol];
   }
