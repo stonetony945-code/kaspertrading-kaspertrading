@@ -29,7 +29,8 @@ import * as chart from '../src/core/chart.js';
 import * as data from '../src/core/data.js';
 import { disconnect, evaluate as evaluateInPage } from '../src/connection.js';
 import { summarise } from '../src/core/derived-indicators.js';
-import { evaluate, isComparable } from '../src/core/signal.js';
+import { spawn } from 'node:child_process';
+import { evaluate, isComparable, stabiliseDirection } from '../src/core/signal.js';
 
 const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..');
 const DIR = join(ROOT, 'snapshots');
@@ -51,6 +52,8 @@ const stamp = () => new Date().toISOString().slice(11, 19);
 
 /** Per-symbol previous tick, so event criteria have something to compare to. */
 const previous = new Map();
+/** Per-symbol history of raw 1h trend readings, for the hysteresis below. */
+const htfHistory = new Map();
 
 function logLine(file, obj) {
   mkdirSync(DIR, { recursive: true });
@@ -183,6 +186,23 @@ function describe(symbol, cur, verdicts) {
     + `  ${gate}`;
 }
 
+/**
+ * Push the alert to the desktop. Detached and never awaited: a notification
+ * that hangs must not stall the polling loop, and a failure here must not lose
+ * the alert — the log line is written regardless.
+ */
+function notifyDesktop(title, message) {
+  try {
+    const ps = spawn('powershell.exe', [
+      '-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass',
+      '-File', join(ROOT, 'scripts', 'notify.ps1'),
+      '-Title', title, '-Message', message,
+    ], { detached: true, stdio: 'ignore' });
+    ps.unref();
+    ps.on('error', () => {});
+  } catch { /* the file log is the source of truth */ }
+}
+
 function announce(symbol, cur, hit) {
   const lines = [
     '',
@@ -196,6 +216,10 @@ function announce(symbol, cur, hit) {
     '',
   ];
   console.log(lines.join('\n'));
+  notifyDesktop(
+    `SIGNAL ${hit.direction.toUpperCase()} — ${symbol}`,
+    `${cur.price}  ·  K${cur.stochastic?.k}/D${cur.stochastic?.d}  ·  ATR ${cur.atr?.state}  ·  vol x${cur.relative_volume?.ratio}`
+  );
   logLine(`alerts-${today()}.log`, {
     at: new Date().toISOString(), session: sessionOf(), symbol,
     direction: hit.direction, price: cur.price,
@@ -241,6 +265,19 @@ async function tick(watchlist, timeframe) {
         continue;
       }
 
+      // The 1h trend flips for a single tick near its own crossover, and a
+      // filter that vacillates rejects valid setups for a reason that lasts
+      // five minutes. Require the same reading twice before the filter acts on
+      // it. A gap resets the history: directions either side of a hole are not
+      // consecutive observations.
+      const hist = (fresh ? htfHistory.get(symbol) : null) ?? [];
+      hist.push(cur.higher_timeframe?.direction ?? null);
+      if (hist.length > 6) hist.shift();
+      htfHistory.set(symbol, hist);
+      const settled = stabiliseDirection(hist);
+      const rawHtf = cur.higher_timeframe?.direction ?? null;
+      if (cur.higher_timeframe) cur.higher_timeframe.direction = settled;
+
       const prev = fresh ? stored.reading : null;
       const verdicts = evaluate(cur, prev, ctx);
       previous.set(symbol, { reading: cur, at: now });
@@ -252,6 +289,7 @@ async function tick(watchlist, timeframe) {
         price: cur.price, stale: cur.stale === true,
         stochastic: cur.stochastic, atr: cur.atr,
         relative_volume: cur.relative_volume, higher_timeframe: cur.higher_timeframe,
+        htf_raw: rawHtf, htf_settled: settled,
         fvg: cur.fair_value_gaps?.unfilled_total ?? null,
         price_vs_value: cur.volume_profile?.price_vs_value ?? null,
         signal_ma: ctx.signalMa, smc: ctx.smcDirection, smc_internal: ctx.smcInternal,

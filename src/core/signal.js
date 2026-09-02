@@ -43,6 +43,28 @@ function crossedUpFromOversold(prev, cur, threshold = 20) {
 const verdict = v => (v === null || v === undefined ? UNKNOWN : v ? MET : UNMET);
 
 /**
+ * Direction confirmed by repetition, for readings that flicker.
+ *
+ * The higher-timeframe trend flips for a single tick near its own crossover —
+ * observed three times on 2026-09-02 — and a filter that vacillates rejects
+ * valid setups for a reason that lasts five minutes. Requiring the same answer
+ * `needed` times running keeps the filter honest without smoothing the data
+ * itself.
+ *
+ * Returns the last direction that held for `needed` consecutive readings, or
+ * null while nothing has settled. Null blocks, which is the safe failure.
+ */
+export function stabiliseDirection(history, needed = 2) {
+  if (!Array.isArray(history) || history.length < needed) return null;
+  for (let end = history.length; end >= needed; end--) {
+    const slice = history.slice(end - needed, end);
+    const first = slice[0];
+    if (first != null && slice.every(d => d === first)) return first;
+  }
+  return null;
+}
+
+/**
  * Is the previous reading recent enough to compare against?
  *
  * The crossing checks assume two consecutive ticks. If polling stalled -- the

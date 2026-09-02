@@ -11,7 +11,7 @@
 
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
-import { evaluate, isComparable, _internals } from '../src/core/signal.js';
+import { evaluate, isComparable, stabiliseDirection, _internals } from '../src/core/signal.js';
 
 const { crossedDownFromOverbought, crossedUpFromOversold } = _internals;
 const st = (k, d) => ({ k, d });
@@ -151,6 +151,43 @@ describe('isComparable', () => {
   it('rejects a missing or backwards timestamp rather than assuming', () => {
     assert.equal(isComparable(null, FIVE_MIN, FIVE_MIN), false);
     assert.equal(isComparable(FIVE_MIN, 0, FIVE_MIN), false);
+  });
+});
+
+describe('stabiliseDirection', () => {
+  it('ignores a one-tick flip', () => {
+    // 2026-09-02 16:16: the 1h trend read bullish for a single tick and was
+    // bearish again five minutes later.
+    assert.equal(stabiliseDirection(['bearish', 'bearish', 'bullish']), 'bearish');
+  });
+
+  it('accepts a change once it repeats', () => {
+    assert.equal(stabiliseDirection(['bearish', 'bullish', 'bullish']), 'bullish');
+  });
+
+  it('returns null while nothing has settled', () => {
+    assert.equal(stabiliseDirection(['bearish', 'bullish']), null);
+    assert.equal(stabiliseDirection(['bearish']), null);
+    assert.equal(stabiliseDirection([]), null);
+  });
+
+  it('falls back to the last settled direction through later noise', () => {
+    assert.equal(stabiliseDirection(['bullish', 'bullish', 'bearish', 'mixed']), 'bullish');
+  });
+
+  it('honours a longer confirmation window', () => {
+    assert.equal(stabiliseDirection(['bullish', 'bullish', 'bullish'], 3), 'bullish');
+    assert.equal(stabiliseDirection(['bearish', 'bearish', 'bearish', 'bullish'], 3), 'bearish');
+  });
+
+  it('settles on nothing when no run reaches the window', () => {
+    // Two of each never makes three in a row, so a 3-tick window has nothing
+    // to confirm — and null blocks rather than picking the longer run.
+    assert.equal(stabiliseDirection(['bearish', 'bearish', 'bullish', 'bullish'], 3), null);
+  });
+
+  it('never treats nulls as a confirmed direction', () => {
+    assert.equal(stabiliseDirection([null, null, null]), null);
   });
 });
 
