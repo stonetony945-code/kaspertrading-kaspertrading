@@ -22,6 +22,7 @@
  * display will flip. Use --no-switch when you are working on the chart.
  */
 
+import dotenv from 'dotenv';
 import { readFileSync, appendFileSync, mkdirSync } from 'node:fs';
 import { join, dirname, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -31,9 +32,16 @@ import { disconnect, evaluate as evaluateInPage } from '../src/connection.js';
 import { summarise } from '../src/core/derived-indicators.js';
 import { spawn } from 'node:child_process';
 import { evaluate, isComparable, stabiliseDirection } from '../src/core/signal.js';
+import { sendTelegram, telegramConfigured, formatSignal } from '../src/core/notify.js';
+import { sizePosition, targetDistance, CONTRACT } from '../src/core/position.js';
 
 const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..');
 const DIR = join(ROOT, 'snapshots');
+
+// dotenv reads from the current working directory, and a scheduled task starts
+// in System32 rather than the project. Loading it by path meant the monitor
+// silently ran without Telegram in production while working by hand.
+dotenv.config({ path: join(ROOT, '.env') });
 const args = process.argv.slice(2);
 const argVal = (name, dflt) => {
   const i = args.indexOf(name);
@@ -54,6 +62,8 @@ const stamp = () => new Date().toISOString().slice(11, 19);
 const previous = new Map();
 /** Per-symbol history of raw 1h trend readings, for the hysteresis below. */
 const htfHistory = new Map();
+/** Account balance from rules.json, for the levels quoted in an alert. */
+let ACCOUNT = 100;
 
 function logLine(file, obj) {
   mkdirSync(DIR, { recursive: true });
@@ -216,10 +226,40 @@ function announce(symbol, cur, hit) {
     '',
   ];
   console.log(lines.join('\n'));
+
+  // Levels are computed here rather than left to the reader: the alert arrives
+  // away from the chart, so the numbers that decide the trade travel with it.
+  let stop = null;
+  let target = null;
+  try {
+    const key = symbol.replace(/^[A-Z]+:/, '').toUpperCase();
+    const contract = CONTRACT[key];
+    if (contract && cur.atr?.value) {
+      const sized = sizePosition({ atr: cur.atr.value, account: ACCOUNT, contract });
+      const dp = cur.price_decimals ?? 5;
+      const dir = hit.direction === 'bearish' ? -1 : 1;
+      stop = (cur.price - dir * sized.stopDistance).toFixed(dp);
+      target = (cur.price + dir * targetDistance(sized.stopDistance)).toFixed(dp);
+    }
+  } catch { /* levels are a convenience; the alert matters more */ }
+
   notifyDesktop(
     `SIGNAL ${hit.direction.toUpperCase()} — ${symbol}`,
     `${cur.price}  ·  K${cur.stochastic?.k}/D${cur.stochastic?.d}  ·  ATR ${cur.atr?.state}  ·  vol x${cur.relative_volume?.ratio}`
   );
+
+  if (telegramConfigured()) {
+    // Not awaited: delivery must not stall polling, and the log line below is
+    // written whether or not the message gets through.
+    sendTelegram(formatSignal({
+      symbol, direction: hit.direction, price: cur.price,
+      stochastic: cur.stochastic, atr: cur.atr,
+      volume: cur.relative_volume, htf: cur.higher_timeframe,
+      stop, target,
+    })).then(r => {
+      if (!r.ok) console.log(`${stamp()}  /!\\ Telegram non delivre : ${r.reason}`);
+    });
+  }
   logLine(`alerts-${today()}.log`, {
     at: new Date().toISOString(), session: sessionOf(), symbol,
     direction: hit.direction, price: cur.price,
@@ -307,6 +347,7 @@ async function tick(watchlist, timeframe) {
 async function main() {
   const rules = JSON.parse(readFileSync(join(ROOT, 'rules.json'), 'utf8'));
   const timeframe = rules.default_timeframe || '15';
+  ACCOUNT = rules.account?.balance_usd ?? ACCOUNT;
   let watchlist = SYMBOLS.length ? SYMBOLS : (rules.watchlist || []);
   if (!SWITCH && !SYMBOLS.length) {
     const st = await chart.getState();
@@ -315,6 +356,7 @@ async function main() {
 
   console.log(`\n  Moniteur — ${watchlist.join(', ')} en ${timeframe} min, releve toutes les ${INTERVAL_MIN} min`);
   console.log(`  Journal : snapshots/monitor-${today()}.jsonl`);
+  console.log(`  Telegram : ${telegramConfigured() ? 'configure' : 'non configure (alertes en fichier seulement)'}`);
   if (SWITCH && watchlist.length > 1) console.log('  Le chart changera de symbole a chaque releve (--no-switch pour l\'eviter).');
   console.log('  Ctrl+C pour arreter.\n');
 

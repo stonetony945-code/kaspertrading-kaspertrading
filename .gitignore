@@ -11,3 +11,7 @@ rules.json
 
 # Market snapshots written by scripts/snapshot.js — generated artefacts.
 snapshots/
+
+# Secrets: Telegram bot token and chat id. Never commit this.
+# Copy .env.example and fill it in — see scripts/test-notify.js to verify.
+.env
