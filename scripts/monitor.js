@@ -29,7 +29,7 @@ import * as chart from '../src/core/chart.js';
 import * as data from '../src/core/data.js';
 import { disconnect } from '../src/connection.js';
 import { summarise } from '../src/core/derived-indicators.js';
-import { evaluate } from '../src/core/signal.js';
+import { evaluate, isComparable } from '../src/core/signal.js';
 
 const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..');
 const DIR = join(ROOT, 'snapshots');
@@ -158,13 +158,46 @@ async function tick(watchlist, timeframe) {
   for (const symbol of watchlist) {
     try {
       const { cur, ctx } = await readSymbol(symbol, timeframe);
-      const prev = previous.get(symbol) ?? null;
+
+      // Modern standby freezes this process without killing it, so the
+      // supervisor sees nothing to restart and the log simply resumes hours
+      // later as though the market had been quiet. Detect the hole: report it,
+      // and drop the stale reading so no crossing is inferred across it.
+      const now = Date.now();
+      const stored = previous.get(symbol) ?? null;
+      const fresh = stored && isComparable(stored.at, now, INTERVAL_MIN * 60_000);
+      let gapMin = null;
+      if (stored && !fresh) {
+        gapMin = Math.round((now - stored.at) / 60_000);
+        const line = `${stamp()}  ${symbol.padEnd(7)} /!\\ TROU DE ${gapMin} MIN — aucune surveillance sur cette periode.`
+          + ' Releve precedent ecarte, aucun croisement ne sera deduit par-dessus.';
+        console.log(line);
+        logLine(`gaps-${today()}.log`, { at: new Date(now).toISOString(), symbol, gap_minutes: gapMin, since: new Date(stored.at).toISOString() });
+      }
+
+      // TradingView does not always resume its feed after the machine wakes:
+      // CDP answers, the API works, and the bars are hours old. Evaluating
+      // that produces confident-looking readings from a dead market, so refuse
+      // the tick outright rather than let it through as a normal one. It is
+      // also not stored: a frozen bar is not an observation to compare against.
+      if (cur.stale) {
+        const age = cur.last_bar_age_minutes ?? '?';
+        console.log(`${stamp()}  ${symbol.padEnd(7)} /!\\ DONNEES PERIMEES (${age} min) — flux TradingView fige, releve ignore.`);
+        logLine(`gaps-${today()}.log`, {
+          at: new Date(now).toISOString(), symbol, kind: 'stale_feed',
+          last_bar_age_minutes: cur.last_bar_age_minutes ?? null, price: cur.price,
+        });
+        continue;
+      }
+
+      const prev = fresh ? stored.reading : null;
       const verdicts = evaluate(cur, prev, ctx);
-      previous.set(symbol, cur);
+      previous.set(symbol, { reading: cur, at: now });
 
       console.log(describe(symbol, cur, verdicts));
       logLine(`monitor-${today()}.jsonl`, {
         at: new Date().toISOString(), session: sessionOf(), symbol,
+        gap_minutes: gapMin,
         price: cur.price, stale: cur.stale === true,
         stochastic: cur.stochastic, atr: cur.atr,
         relative_volume: cur.relative_volume, higher_timeframe: cur.higher_timeframe,

@@ -43,6 +43,26 @@ function crossedUpFromOversold(prev, cur, threshold = 20) {
 const verdict = v => (v === null || v === undefined ? UNKNOWN : v ? MET : UNMET);
 
 /**
+ * Is the previous reading recent enough to compare against?
+ *
+ * The crossing checks assume two consecutive ticks. If polling stalled -- the
+ * machine slept, the process was frozen, TradingView was closed -- the stored
+ * reading can be hours old, and comparing across that hole would report a
+ * "crossing" that is really just where the market happened to be before and
+ * after. On 2026-09-02 the monitor was frozen for eleven hours and resumed as
+ * though nothing had happened; without this the first tick back could have
+ * fired a signal spanning the whole night.
+ *
+ * Two intervals of tolerance: one late tick is normal scheduling jitter, two
+ * missed in a row is a hole.
+ */
+export function isComparable(prevAt, now, intervalMs, tolerance = 2) {
+  if (prevAt == null || now == null || !(intervalMs > 0)) return false;
+  const elapsed = now - prevAt;
+  return elapsed >= 0 && elapsed <= intervalMs * tolerance;
+}
+
+/**
  * Filters are vetoes: each must be met, and an unknown blocks too. Refusing to
  * trade on a reading we could not take is the conservative failure.
  */

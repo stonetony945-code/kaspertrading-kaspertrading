@@ -11,7 +11,7 @@
 
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
-import { evaluate, _internals } from '../src/core/signal.js';
+import { evaluate, isComparable, _internals } from '../src/core/signal.js';
 
 const { crossedDownFromOverbought, crossedUpFromOversold } = _internals;
 const st = (k, d) => ({ k, d });
@@ -123,6 +123,34 @@ describe('unknown readings block rather than pass', () => {
     const r = evaluate(cur, prev, { smcDirection: null });
     assert.equal(r.bearish.triggers.structure, 'unknown');
     assert.equal(r.bearish.signal, false);
+  });
+});
+
+describe('isComparable', () => {
+  const FIVE_MIN = 5 * 60_000;
+
+  it('accepts a tick at the expected interval', () => {
+    assert.equal(isComparable(0, FIVE_MIN, FIVE_MIN), true);
+  });
+
+  it('tolerates one late tick as scheduling jitter', () => {
+    assert.equal(isComparable(0, FIVE_MIN * 1.9, FIVE_MIN), true);
+  });
+
+  it('rejects a reading from across an eleven-hour freeze', () => {
+    // 2026-09-02: the monitor was frozen by modern standby from 21:12 to
+    // 08:15 and resumed as if nothing had happened. Comparing across that
+    // hole would report a crossing spanning the night.
+    assert.equal(isComparable(0, 11 * 60 * 60_000, FIVE_MIN), false);
+  });
+
+  it('rejects anything past two intervals', () => {
+    assert.equal(isComparable(0, FIVE_MIN * 2.1, FIVE_MIN), false);
+  });
+
+  it('rejects a missing or backwards timestamp rather than assuming', () => {
+    assert.equal(isComparable(null, FIVE_MIN, FIVE_MIN), false);
+    assert.equal(isComparable(FIVE_MIN, 0, FIVE_MIN), false);
   });
 });
 
