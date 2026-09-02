@@ -27,7 +27,7 @@ import { join, dirname, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import * as chart from '../src/core/chart.js';
 import * as data from '../src/core/data.js';
-import { disconnect } from '../src/connection.js';
+import { disconnect, evaluate as evaluateInPage } from '../src/connection.js';
 import { summarise } from '../src/core/derived-indicators.js';
 import { evaluate, isComparable } from '../src/core/signal.js';
 
@@ -70,6 +70,41 @@ function sessionOf(d = new Date()) {
   return 'hors-session';
 }
 
+/**
+ * Label sizes SMC uses for its two structure levels, read from the indicator's
+ * own inputs rather than assumed: the user can change either, and hardcoding
+ * "small" would silently start reading the wrong level if they did.
+ * Cached — the settings do not change mid-session.
+ */
+let cachedSizes = null;
+async function smcLabelSizes() {
+  if (cachedSizes) return cachedSizes;
+  const found = await evaluateInPage(`
+    (function() {
+      var chart = window.TradingViewApi._activeChartWidgetWV.value();
+      var ids = chart.getAllStudies ? chart.getAllStudies() : [];
+      var target = null;
+      for (var i = 0; i < ids.length; i++) {
+        if (/Smart Money Concepts/i.test(ids[i].name || '')) { target = ids[i].id; break; }
+      }
+      if (!target) return null;
+      var s = chart.getStudyById(target);
+      var info = s.getInputsInfo();
+      var arr = Array.isArray(info) ? info : (info && info.inputs) || [];
+      var vals = {};
+      s.getInputValues().forEach(function(v) { vals[v.id] = v.value; });
+      var out = {};
+      arr.forEach(function(i) {
+        if (/Internal Label Size/i.test(i.name || '')) out.internal = vals[i.id];
+        if (/Swing Label Size/i.test(i.name || '')) out.swing = vals[i.id];
+      });
+      return out;
+    })()
+  `);
+  cachedSizes = { swing: found?.swing || 'small', internal: found?.internal || 'tiny' };
+  return cachedSizes;
+}
+
 async function readSymbol(symbol, timeframe) {
   if (SWITCH) {
     // Only touch the chart when it is not already showing what we want: with a
@@ -104,13 +139,29 @@ async function readSymbol(symbol, timeframe) {
     }
   } catch { /* leave null -> criterion reports unknown */ }
 
+  // SMC draws two levels of structure at once, and they disagree constantly:
+  // internal structure fires on small moves, swing structure marks the real
+  // turns. Taking whichever label came last mixed them, and on 2026-09-02 an
+  // internal CHoCH read as "bullish" blocked a bearish setup that the swing
+  // structure (a bearish BOS) agreed with. They are told apart by label size,
+  // which the indicator's own inputs define.
   let smcDirection = null;
+  let smcInternal = null;
   try {
-    const lab = await data.getPineLabels({ study_filter: 'Smart Money Concepts', max_labels: 1 });
-    smcDirection = lab.studies?.[0]?.labels?.[0]?.direction ?? null;
+    const sizes = await smcLabelSizes();
+    const lab = await data.getPineLabels({ study_filter: 'Smart Money Concepts', max_labels: 60, verbose: true });
+    const labels = lab.studies?.[0]?.labels ?? [];
+    const lastOf = size => {
+      const m = labels.filter(l => l.size === size && l.direction);
+      return m.length ? m[m.length - 1].direction : null;
+    };
+    smcDirection = lastOf(sizes.swing);
+    smcInternal = lastOf(sizes.internal);
+    // Without swing labels in the window, say nothing rather than fall back to
+    // internal: an unknown blocks, a wrong answer trades.
   } catch { /* leave null */ }
 
-  return { cur, ctx: { signalMa, smcDirection } };
+  return { cur, ctx: { signalMa, smcDirection, smcInternal } };
 }
 
 function describe(symbol, cur, verdicts) {
@@ -203,7 +254,7 @@ async function tick(watchlist, timeframe) {
         relative_volume: cur.relative_volume, higher_timeframe: cur.higher_timeframe,
         fvg: cur.fair_value_gaps?.unfilled_total ?? null,
         price_vs_value: cur.volume_profile?.price_vs_value ?? null,
-        signal_ma: ctx.signalMa, smc: ctx.smcDirection,
+        signal_ma: ctx.signalMa, smc: ctx.smcDirection, smc_internal: ctx.smcInternal,
         bearish: { filters: verdicts.bearish.filters, triggers: verdicts.bearish.triggers, blockedBy: verdicts.bearish.blockedBy },
         bullish: { filters: verdicts.bullish.filters, triggers: verdicts.bullish.triggers, blockedBy: verdicts.bullish.blockedBy },
       });
