@@ -28,11 +28,43 @@ const KNOWN_PATHS = {
 
 export { KNOWN_PATHS };
 
+/**
+ * Ceiling on any single CDP call, in ms. Overridable via CDP_TIMEOUT_MS.
+ *
+ * Every request to the page needs one, because none of them fail on their own.
+ * When TradingView loses its network the socket stays open and the page simply
+ * never answers, so the caller waits forever. On 2026-09-03 that cost 571
+ * minutes overnight and 297 more in the afternoon: the process stayed alive,
+ * the supervisor saw nothing to restart, and not one error was logged — there
+ * was nothing to log, since no call ever returned. A deadline turns that
+ * silence into an error a caller can act on.
+ *
+ * Declared here, above its callers, rather than relying on hoisting from the
+ * bottom of the file.
+ */
+const CDP_TIMEOUT_MS = Number(process.env.CDP_TIMEOUT_MS) || 30000;
+
+function withTimeout(promise, ms, label) {
+  let timer;
+  const guard = new Promise((_, reject) => {
+    timer = setTimeout(() => reject(new Error(`CDP timeout after ${ms}ms (${label})`)), ms);
+  });
+  return Promise.race([promise, guard]).finally(() => clearTimeout(timer));
+}
+
 export async function getClient() {
   if (client) {
     try {
-      // Quick liveness check
-      await client.Runtime.evaluate({ expression: '1', returnByValue: true });
+      // Liveness check, and the one call that must never hang: it runs before
+      // every other request, so a block here stops everything upstream without
+      // reaching any handler. On 2026-09-03 an internet outage left the page
+      // unresponsive and the monitor sat here for 297 minutes — silent, since
+      // no error was ever raised to log. Short deadline: this is a ping.
+      await withTimeout(
+        client.Runtime.evaluate({ expression: '1', returnByValue: true }),
+        5000,
+        'liveness check'
+      );
       return client;
     } catch {
       client = null;
@@ -69,7 +101,13 @@ export async function connect() {
 }
 
 async function findChartTarget() {
-  const resp = await fetch(`http://${CDP_HOST}:${CDP_PORT}/json/list`);
+  // Same reasoning as the liveness check: this runs before any work and had no
+  // deadline, so a stalled socket would hang the caller with nothing logged.
+  const resp = await withTimeout(
+    fetch(`http://${CDP_HOST}:${CDP_PORT}/json/list`),
+    5000,
+    'target list'
+  );
   const targets = await resp.json();
   // Prefer targets with tradingview.com/chart in the URL
   return targets.find(t => t.type === 'page' && /tradingview\.com\/chart/i.test(t.url))
@@ -82,26 +120,6 @@ export async function getTargetInfo() {
     await getClient();
   }
   return targetInfo;
-}
-
-/**
- * Ceiling on any single CDP call, in ms. Overridable via CDP_TIMEOUT_MS.
- *
- * Runtime.evaluate can hang indefinitely when TradingView loses its network:
- * the socket stays open, the page never answers, and the caller waits forever.
- * On 2026-09-03 an internet outage at midnight left the monitor blocked for
- * 571 minutes on a single call — the process was alive, the supervisor saw
- * nothing to restart, and nine hours of market went unwatched. A timeout turns
- * that silence into an error the caller can act on.
- */
-const CDP_TIMEOUT_MS = Number(process.env.CDP_TIMEOUT_MS) || 30000;
-
-function withTimeout(promise, ms, label) {
-  let timer;
-  const guard = new Promise((_, reject) => {
-    timer = setTimeout(() => reject(new Error(`CDP timeout after ${ms}ms (${label})`)), ms);
-  });
-  return Promise.race([promise, guard]).finally(() => clearTimeout(timer));
 }
 
 export async function evaluate(expression, opts = {}) {

@@ -52,6 +52,30 @@ while ($true) {
 
     Log "Lancement du moniteur"
     $started = Get-Date
+
+    # Watchdog. Restarting a dead process is not enough: twice on 2026-09-03 the
+    # monitor stayed alive and simply stopped producing ticks, once for five
+    # hours, with every health indicator green. Liveness is whether readings are
+    # arriving, not whether the process exists — so watch the log's mtime and
+    # kill anything that has gone quiet for four intervals.
+    $job = Start-Job -ScriptBlock {
+        param($root, $interval, $logDir)
+        $limit = [Math]::Max($interval * 4, 20)
+        while ($true) {
+            Start-Sleep -Seconds 60
+            $latest = Get-ChildItem -Path $logDir -Filter 'monitor-*.log' -ErrorAction SilentlyContinue |
+                Sort-Object LastWriteTime -Descending | Select-Object -First 1
+            if (-not $latest) { continue }
+            $quiet = ((Get-Date) - $latest.LastWriteTime).TotalMinutes
+            if ($quiet -ge $limit) {
+                Get-CimInstance Win32_Process -Filter "Name='node.exe'" -ErrorAction SilentlyContinue |
+                    Where-Object { $_.CommandLine -like '*monitor.js*' } |
+                    ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }
+                return "silence de $([math]::Round($quiet)) min - moniteur tue"
+            }
+        }
+    } -ArgumentList $root, $Interval, $logDir
+
     try {
         & node (Join-Path $root 'scripts\monitor.js') '--symbols' $Symbol '--interval' $Interval 2>&1 |
             ForEach-Object { Log $_ }
@@ -59,6 +83,10 @@ while ($true) {
     } catch {
         Log "Le moniteur a plante : $($_.Exception.Message)"
     }
+
+    if ($job.State -eq 'Completed') { Log ("Chien de garde : " + (Receive-Job $job)) }
+    Stop-Job $job -ErrorAction SilentlyContinue
+    Remove-Job $job -Force -ErrorAction SilentlyContinue
 
     # A run that lasted is not a failure: it worked and then something external
     # ended it -- a sleep, a chart reload. Only quick successive deaths mean a
