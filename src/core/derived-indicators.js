@@ -17,6 +17,28 @@
 const round = (v, dp = 2) => (v === null || v === undefined ? null : Number(v.toFixed(dp)));
 
 /**
+ * Bar interval in minutes, taken from the median spacing of recent bars.
+ *
+ * The median rather than the last gap: sessions break, weekends leave an
+ * enormous hole, and a single wide gap would otherwise be read as the chart's
+ * resolution and make the staleness check useless exactly when it matters.
+ */
+export function inferBarIntervalMinutes(bars) {
+  if (!Array.isArray(bars) || bars.length < 5) return null;
+  const gaps = [];
+  const recent = bars.slice(-40);
+  for (let i = 1; i < recent.length; i++) {
+    const d = recent[i].time - recent[i - 1].time;
+    if (d > 0) gaps.push(d);
+  }
+  if (!gaps.length) return null;
+  gaps.sort((a, b) => a - b);
+  const median = gaps[Math.floor(gaps.length / 2)];
+  const minutes = Math.round(median / 60);
+  return minutes > 0 ? minutes : null;
+}
+
+/**
  * Price precision varies wildly by instrument: gold quotes ~4454.99, GBPUSD
  * ~1.35319. A fixed 2-decimal round collapses forex levels into meaningless
  * duplicates, so infer the instrument's real precision from its own bars.
@@ -88,9 +110,20 @@ export function summarise(bars, { include, options = {} } = {}) {
     const ageMin = Math.round((Date.now() - last.time * 1000) / 60000);
     out.last_bar_time = new Date(last.time * 1000).toISOString();
     out.last_bar_age_minutes = ageMin;
-    if (ageMin > 120) {
+    // Staleness is relative to the bar interval, not a flat two hours. That
+    // flat threshold came from weekend detection, where the data was days old;
+    // on a 15-minute chart it let a feed that froze at 00:00 report as healthy
+    // until 02:00. Three bars is the tolerance: one late bar is normal, three
+    // means nothing is arriving. Falls back to two hours when the interval
+    // cannot be derived, which is the old behaviour rather than no check.
+    const intervalMin = options.bar_interval_minutes ?? inferBarIntervalMinutes(bars);
+    const limit = intervalMin ? Math.max(intervalMin * 3, 10) : 120;
+    if (ageMin > limit) {
       out.stale = true;
-      out.stale_warning = `Newest bar is ${Math.round(ageMin / 60)}h old — market likely closed. These are not live readings.`;
+      out.stale_limit_minutes = limit;
+      out.stale_warning = ageMin >= 120
+        ? `Newest bar is ${Math.round(ageMin / 60)}h old — market likely closed or feed dead. These are not live readings.`
+        : `Newest bar is ${ageMin} min old, over the ${limit} min limit for a ${intervalMin} min chart — the feed has stopped updating.`;
     }
   }
 

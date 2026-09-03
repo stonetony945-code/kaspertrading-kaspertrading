@@ -223,6 +223,29 @@ describe('summarise', () => {
     assert.equal(out.volume_profile, undefined);
   });
 
+  it('flags a feed that stopped, well before the old two-hour limit', () => {
+    // 2026-09-03: the feed froze at 00:00 and the flat 120-minute threshold let
+    // an hour of identical readings pass as healthy. On a 15-minute chart,
+    // three missed bars already means nothing is arriving.
+    const now = Math.floor(Date.now() / 1000);
+    const bars = Array.from({ length: 40 }, (_, i) => ({
+      ...bar(1.35401, 1.3526, 1.35319),
+      time: now - (40 - i) * 900 - 50 * 60,   // 15-min bars, newest 50 min old
+    }));
+    const out = summarise(bars, { include: new Set(['fvg']) });
+    assert.equal(out.stale, true, 'a 50-minute-old bar on a 15m chart is stale');
+    assert.equal(out.stale_limit_minutes, 45);
+  });
+
+  it('does not flag a bar that is merely late', () => {
+    const now = Math.floor(Date.now() / 1000);
+    const bars = Array.from({ length: 40 }, (_, i) => ({
+      ...bar(1.35401, 1.3526, 1.35319),
+      time: now - (40 - i) * 900 - 20 * 60,   // newest 20 min old, under 45
+    }));
+    assert.equal(summarise(bars, { include: new Set(['fvg']) }).stale, undefined);
+  });
+
   it('flags stale data when the newest bar is hours old', () => {
     const old = Math.floor(Date.now() / 1000) - 44 * 3600;
     const bars = fxGap.map((b, i) => ({ ...b, time: old + i * 900 }));

@@ -84,14 +84,38 @@ export async function getTargetInfo() {
   return targetInfo;
 }
 
+/**
+ * Ceiling on any single CDP call, in ms. Overridable via CDP_TIMEOUT_MS.
+ *
+ * Runtime.evaluate can hang indefinitely when TradingView loses its network:
+ * the socket stays open, the page never answers, and the caller waits forever.
+ * On 2026-09-03 an internet outage at midnight left the monitor blocked for
+ * 571 minutes on a single call — the process was alive, the supervisor saw
+ * nothing to restart, and nine hours of market went unwatched. A timeout turns
+ * that silence into an error the caller can act on.
+ */
+const CDP_TIMEOUT_MS = Number(process.env.CDP_TIMEOUT_MS) || 30000;
+
+function withTimeout(promise, ms, label) {
+  let timer;
+  const guard = new Promise((_, reject) => {
+    timer = setTimeout(() => reject(new Error(`CDP timeout after ${ms}ms (${label})`)), ms);
+  });
+  return Promise.race([promise, guard]).finally(() => clearTimeout(timer));
+}
+
 export async function evaluate(expression, opts = {}) {
   const c = await getClient();
-  const result = await c.Runtime.evaluate({
-    expression,
-    returnByValue: true,
-    awaitPromise: opts.awaitPromise ?? false,
-    ...opts,
-  });
+  const result = await withTimeout(
+    c.Runtime.evaluate({
+      expression,
+      returnByValue: true,
+      awaitPromise: opts.awaitPromise ?? false,
+      ...opts,
+    }),
+    opts.timeoutMs ?? CDP_TIMEOUT_MS,
+    'Runtime.evaluate'
+  );
   if (result.exceptionDetails) {
     const msg = result.exceptionDetails.exception?.description
       || result.exceptionDetails.text
