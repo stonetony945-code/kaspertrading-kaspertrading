@@ -62,6 +62,13 @@ const stamp = () => new Date().toISOString().slice(11, 19);
 const previous = new Map();
 /** Per-symbol history of raw 1h trend readings, for the hysteresis below. */
 const htfHistory = new Map();
+/**
+ * Per-symbol count of consecutive ticks whose SMC structure could not be read.
+ * The strategy needs two triggers and one of them is the structure, so while
+ * this is climbing the monitor cannot emit a signal at all — a state that has
+ * to be announced once, not on every tick.
+ */
+const smcBlindStreak = new Map();
 /** Account balance from rules.json, for the levels quoted in an alert. */
 let ACCOUNT = 100;
 
@@ -114,8 +121,12 @@ async function smcLabelSizes() {
       return out;
     })()
   `);
-  cachedSizes = { swing: found?.swing || 'small', internal: found?.internal || 'tiny' };
-  return cachedSizes;
+  // Only cache a real answer. Caching the fallback would freeze the defaults in
+  // for the life of the process, so an SMC re-added to the chart mid-run would
+  // keep being read with assumed label sizes instead of its own.
+  const sizes = { swing: found?.swing || 'small', internal: found?.internal || 'tiny' };
+  if (found?.swing || found?.internal) cachedSizes = sizes;
+  return sizes;
 }
 
 async function readSymbol(symbol, timeframe) {
@@ -177,7 +188,7 @@ async function readSymbol(symbol, timeframe) {
   return { cur, ctx: { signalMa, smcDirection, smcInternal } };
 }
 
-function describe(symbol, cur, verdicts) {
+function describe(symbol, cur, verdicts, ctx = {}) {
   const s = cur.stochastic || {};
   const a = cur.atr || {};
   const v = cur.relative_volume || {};
@@ -190,10 +201,58 @@ function describe(symbol, cur, verdicts) {
   const gate = side.filtersPass
     ? `filtres OK (${side.direction})`
     : `bloque: ${side.blockedBy.join(',')}`;
+  // "filtres OK" reads as a healthy tick, and it prints whether or not the
+  // structure could be read at all. On 2026-09-04 SMC fell off the chart and 61
+  // consecutive ticks looked exactly like this while no signal could physically
+  // fire. Say so on the line itself: a blind monitor must not resemble a quiet
+  // market.
+  const blind = ctx.smcDirection ? '' : '  /!\\ SMC illisible — aucun signal possible';
   return `${stamp()}  ${symbol.padEnd(7)} ${String(cur.price).padEnd(11)}`
     + ` K${s.k ?? '—'}/D${s.d ?? '—'}`
     + `  ATR ${a.state ?? '—'}  vol ${v.state ?? '—'}  1h ${h.direction ?? '—'}`
-    + `  ${gate}`;
+    + `  ${gate}${blind}`;
+}
+
+/**
+ * Announce the loss and the return of the SMC structure, once per outage.
+ *
+ * Deliberately not a per-tick warning: the console line already carries the
+ * marker, and a Telegram message every five minutes for hours would train the
+ * user to ignore the channel that also carries the signals. One message when
+ * the blindness sets in, one when it clears.
+ */
+function checkStructureReadable(symbol, ctx) {
+  const readable = Boolean(ctx.smcDirection);
+  const streak = smcBlindStreak.get(symbol) ?? 0;
+
+  if (!readable) {
+    smcBlindStreak.set(symbol, streak + 1);
+    if (streak !== 0) return;  // already announced for this outage
+    const msg = `${symbol} : structure SMC illisible — l'indicateur Smart Money Concepts`
+      + ' n\'est plus lisible sur le graphique. Aucun signal ne peut partir tant que c\'est le cas.';
+    console.log(`${stamp()}  /!\\ ${msg}`);
+    logLine(`gaps-${today()}.log`, {
+      at: new Date().toISOString(), symbol, kind: 'smc_unreadable',
+    });
+    if (telegramConfigured()) {
+      sendTelegram(`/!\\ Surveillance aveugle\n\n${msg}`).then(r => {
+        if (!r.ok) console.log(`${stamp()}  /!\\ Telegram non delivre : ${r.reason}`);
+      });
+    }
+    return;
+  }
+
+  if (streak > 0) {
+    smcBlindStreak.set(symbol, 0);
+    const msg = `${symbol} : structure SMC de nouveau lisible apres ${streak} releve(s) aveugle(s).`;
+    console.log(`${stamp()}  ${msg}`);
+    logLine(`gaps-${today()}.log`, {
+      at: new Date().toISOString(), symbol, kind: 'smc_recovered', blind_ticks: streak,
+    });
+    if (telegramConfigured()) {
+      sendTelegram(`Surveillance retablie\n\n${msg}`).then(() => {});
+    }
+  }
 }
 
 /**
@@ -305,6 +364,16 @@ async function tick(watchlist, timeframe) {
         continue;
       }
 
+      // Structure is one of the two triggers, and an unknown verdict never
+      // counts as met — so with SMC off the chart the monitor is not merely
+      // less informed, it is incapable of emitting anything. Nothing said so:
+      // on 2026-09-04 the indicator was dropped at 09:10 (TradingView Basic
+      // caps a chart at two studies) and five hours of ticks kept printing
+      // "filtres OK" while three stochastic crossings passed unusable. Warn on
+      // the way in and on the way out, once each, so an outage is visible
+      // without burying the log.
+      checkStructureReadable(symbol, ctx);
+
       // The 1h trend flips for a single tick near its own crossover, and a
       // filter that vacillates rejects valid setups for a reason that lasts
       // five minutes. Require the same reading twice before the filter acts on
@@ -322,7 +391,7 @@ async function tick(watchlist, timeframe) {
       const verdicts = evaluate(cur, prev, ctx);
       previous.set(symbol, { reading: cur, at: now });
 
-      console.log(describe(symbol, cur, verdicts));
+      console.log(describe(symbol, cur, verdicts, ctx));
       logLine(`monitor-${today()}.jsonl`, {
         at: new Date().toISOString(), session: sessionOf(), symbol,
         gap_minutes: gapMin,
