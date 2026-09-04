@@ -169,6 +169,30 @@ async function main() {
     } catch {}
   }
 
+  // A capture built on a frozen feed is worse than no capture: it is saved
+  // under a session name, becomes the baseline the next --compare diffs
+  // against, and reads as a real observation of that session. On 2026-09-04
+  // the catch-up runs for Asia and London both fired at 08:15 against bars
+  // 676 minutes old and produced two identical, meaningless files.
+  //
+  // The monitor already refuses stale ticks; this is the same guard for the
+  // capture path. Written only if at least one symbol has live data — a
+  // partial capture is still worth keeping, a wholly frozen one is not.
+  const stale = snap.symbols.filter(s => s.derived?.stale === true);
+  const live = snap.symbols.filter(s => s.derived && !s.derived.stale);
+  if (stale.length) {
+    const ages = stale.map(s => `${s.symbol} ${s.derived.last_bar_age_minutes}min`).join(', ');
+    console.log(`\n  /!\\ Donnees perimees : ${ages}`);
+  }
+  if (!live.length) {
+    // Non-zero so the scheduled wrapper retries rather than recording a
+    // success: its loop waits and tries again, which is exactly the right
+    // response to a feed that has not come back yet.
+    console.log('  Aucune donnee fraiche — capture non enregistree.\n');
+    process.exitCode = 2;
+    return;
+  }
+
   const previous = listSnapshots();
   mkdirSync(DIR, { recursive: true });
   // The session goes in the filename so a capture is identifiable without
