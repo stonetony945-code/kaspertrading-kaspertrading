@@ -34,6 +34,7 @@ import { spawn } from 'node:child_process';
 import { evaluate, isComparable, stabiliseDirection } from '../src/core/signal.js';
 import { sendTelegram, telegramConfigured, formatSignal } from '../src/core/notify.js';
 import { sizePosition, targetDistance, CONTRACT } from '../src/core/position.js';
+import { awaitChart, symbolMatches, resolutionMatches, describeMismatch } from '../src/core/chart-guard.js';
 
 const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..');
 const DIR = join(ROOT, 'snapshots');
@@ -69,6 +70,8 @@ const htfHistory = new Map();
  * to be announced once, not on every tick.
  */
 const smcBlindStreak = new Map();
+/** Per-symbol count of consecutive ticks refused for a frozen feed. */
+const staleStreak = new Map();
 /** Account balance from rules.json, for the levels quoted in an alert. */
 let ACCOUNT = 100;
 
@@ -79,6 +82,21 @@ function logLine(file, obj) {
 
 function today() {
   return new Date().toISOString().slice(0, 10);
+}
+
+/**
+ * True inside the weekly forex close, which is not a fault however much it
+ * looks like one from here: the feed simply stops.
+ *
+ * The weekend branch in main() covers Saturday and Sunday, leaving Friday
+ * evening — where the market shuts around 21:00 UTC but the day is still a
+ * weekday, so the monitor keeps polling a dead feed. Approximate on purpose:
+ * the exact hour shifts with daylight saving and with the broker. It is used
+ * only to word the message, never to skip a reading, so an hour either way
+ * costs nothing.
+ */
+function weeklyClose(d = new Date()) {
+  return d.getUTCDay() === 5 && d.getUTCHours() >= 21;
 }
 
 /** Which session an instant falls in, for context in the log. */
@@ -135,16 +153,19 @@ async function readSymbol(symbol, timeframe) {
     // single symbol this makes the monitor a passive reader after the first
     // tick, instead of re-issuing a switch every few minutes.
     const st = await chart.getState().catch(() => null);
-    const onSymbol = st?.symbol && (st.symbol === symbol || st.symbol.endsWith(`:${symbol}`));
-    const onTimeframe = String(st?.resolution ?? '') === String(timeframe);
-    if (!onSymbol) {
-      await chart.setSymbol({ symbol });
-      await sleep(900);
-    }
-    if (!onTimeframe) {
-      await chart.setTimeframe({ timeframe });
-      await sleep(900);
-    }
+    if (!symbolMatches(st?.symbol, symbol)) await chart.setSymbol({ symbol });
+    if (!resolutionMatches(st?.resolution, timeframe)) await chart.setTimeframe({ timeframe });
+  }
+
+  // Wait for the chart to confirm the switch instead of assuming a fixed delay
+  // covered it. A 900 ms guess did not, nine times over four days: the read ran
+  // against the previous symbol's bars and produced a GBPUSD-labelled tick
+  // carrying a four-digit index price. Checked even without --switch, where the
+  // chart is the user's and can move under us at any moment.
+  const before = await awaitChart({ symbol, timeframe, getState: chart.getState, sleep });
+  if (!before) {
+    const st = await chart.getState().catch(() => null);
+    throw new Error(`lecture abandonnee : ${describeMismatch(st, symbol, timeframe)}`);
   }
 
   const { bars } = await data.getOhlcv({ count: 300 });
@@ -184,6 +205,20 @@ async function readSymbol(symbol, timeframe) {
     // Without swing labels in the window, say nothing rather than fall back to
     // internal: an unknown blocks, a wrong answer trades.
   } catch { /* leave null */ }
+
+  // Close the bracket: everything above came from the chart, so confirm it did
+  // not move mid-read. Checking only before the read would still let a switch
+  // land between the bars and the study values.
+  const after = await chart.getState().catch(() => null);
+  if (!symbolMatches(after?.symbol, symbol) || !resolutionMatches(after?.resolution, timeframe)) {
+    logLine(`gaps-${today()}.log`, {
+      at: new Date().toISOString(), symbol, kind: 'symbol_mismatch',
+      expected: symbol, expected_timeframe: String(timeframe),
+      got: after?.symbol ?? null, got_timeframe: after?.resolution ?? null,
+      price_read: cur.price ?? null,
+    });
+    throw new Error(`releve ecarte : le graphique a change pendant la lecture — ${describeMismatch(after, symbol, timeframe)}`);
+  }
 
   return { cur, ctx: { signalMa, smcDirection, smcInternal } };
 }
@@ -356,12 +391,31 @@ async function tick(watchlist, timeframe) {
       // also not stored: a frozen bar is not an observation to compare against.
       if (cur.stale) {
         const age = cur.last_bar_age_minutes ?? '?';
-        console.log(`${stamp()}  ${symbol.padEnd(7)} /!\\ DONNEES PERIMEES (${age} min) — flux TradingView fige, releve ignore.`);
-        logLine(`gaps-${today()}.log`, {
-          at: new Date(now).toISOString(), symbol, kind: 'stale_feed',
-          last_bar_age_minutes: cur.last_bar_age_minutes ?? null, price: cur.price,
-        });
+        const streak = staleStreak.get(symbol) ?? 0;
+        staleStreak.set(symbol, streak + 1);
+        const closed = weeklyClose();
+        const why = closed ? 'cloture hebdomadaire du forex' : 'flux TradingView fige';
+        console.log(`${stamp()}  ${symbol.padEnd(7)} /!\\ DONNEES PERIMEES (${age} min) — ${why}, releve ignore.`);
+        // Once per outage, not once per tick. A frozen feed lasts hours -- the
+        // whole weekend, when it is simply the market being shut -- and writing
+        // an event every five minutes turned the alert channel into a stream of
+        // identical lines nobody would read to the end.
+        if (streak === 0) {
+          logLine(`gaps-${today()}.log`, {
+            at: new Date(now).toISOString(), symbol, kind: 'stale_feed',
+            reason: closed ? 'weekly_close' : 'frozen_feed',
+            last_bar_age_minutes: cur.last_bar_age_minutes ?? null, price: cur.price,
+          });
+        }
         continue;
+      }
+      const wasStale = staleStreak.get(symbol) ?? 0;
+      if (wasStale > 0) {
+        staleStreak.set(symbol, 0);
+        console.log(`${stamp()}  ${symbol.padEnd(7)} flux repris apres ${wasStale} releve(s) ecarte(s).`);
+        logLine(`gaps-${today()}.log`, {
+          at: new Date(now).toISOString(), symbol, kind: 'feed_recovered', skipped_ticks: wasStale,
+        });
       }
 
       // Structure is one of the two triggers, and an unknown verdict never

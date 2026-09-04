@@ -21,6 +21,7 @@ import * as chart from '../src/core/chart.js';
 import * as data from '../src/core/data.js';
 import { disconnect } from '../src/connection.js';
 import { summarise } from '../src/core/derived-indicators.js';
+import { awaitChart, symbolMatches, resolutionMatches, describeMismatch } from '../src/core/chart-guard.js';
 
 const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..');
 const DIR = join(ROOT, 'snapshots');
@@ -62,9 +63,18 @@ async function smcZones() {
 
 async function captureSymbol(symbol, timeframe) {
   await chart.setSymbol({ symbol });
-  await new Promise(r => setTimeout(r, 1000));
   await chart.setTimeframe({ timeframe });
-  await new Promise(r => setTimeout(r, 1000));
+
+  // The two one-second sleeps that used to stand here were a guess at how long
+  // a symbol switch takes, and the monitor proved the guess wrong nine times:
+  // the read landed on the previous symbol's bars and was filed under the new
+  // symbol's name. Wait for the chart to say it has arrived instead.
+  const sleep = ms => new Promise(r => setTimeout(r, ms));
+  const ready = await awaitChart({ symbol, timeframe, getState: chart.getState, sleep });
+  if (!ready) {
+    const st = await chart.getState().catch(() => null);
+    throw new Error(`capture abandonnee : ${describeMismatch(st, symbol, timeframe)}`);
+  }
 
   const [state, studies, quote] = await Promise.all([
     chart.getState(),
@@ -78,13 +88,22 @@ async function captureSymbol(symbol, timeframe) {
     if (bars && bars.length >= 30) derived = summarise(bars);
   } catch (err) { derived = { error: err.message }; }
 
+  const smc = { structure: await smcStructure(), zones: await smcZones() };
+
+  // Close the bracket: a capture is a session's reference reading and outlives
+  // any single tick, so a chart that moved mid-read must not be filed as one.
+  const after = await chart.getState().catch(() => null);
+  if (!symbolMatches(after?.symbol, symbol) || !resolutionMatches(after?.resolution, timeframe)) {
+    throw new Error(`capture ecartee : le graphique a change pendant la lecture — ${describeMismatch(after, symbol, timeframe)}`);
+  }
+
   return {
     symbol,
     resolution: state.resolution,
     studies: Object.fromEntries((studies.studies || []).map(s => [s.name, s.values])),
     quote: { last: quote.last, time: quote.time, volume: quote.volume },
     derived,
-    smc: { structure: await smcStructure(), zones: await smcZones() },
+    smc,
   };
 }
 
