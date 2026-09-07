@@ -23,7 +23,7 @@
  */
 
 import dotenv from 'dotenv';
-import { readFileSync, appendFileSync, mkdirSync } from 'node:fs';
+import { readFileSync, writeFileSync, appendFileSync, mkdirSync, existsSync } from 'node:fs';
 import { join, dirname, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import * as chart from '../src/core/chart.js';
@@ -35,6 +35,9 @@ import { evaluate, isComparable, stabiliseDirection } from '../src/core/signal.j
 import { sendTelegram, telegramConfigured, formatSignal } from '../src/core/notify.js';
 import { sizePosition, targetDistance, CONTRACT } from '../src/core/position.js';
 import { awaitChart, symbolMatches, resolutionMatches, describeMismatch } from '../src/core/chart-guard.js';
+import {
+  openPosition, updatePosition, expirePosition, formatOutcome, excursions,
+} from '../src/core/signal-tracker.js';
 
 const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..');
 const DIR = join(ROOT, 'snapshots');
@@ -72,6 +75,38 @@ const htfHistory = new Map();
 const smcBlindStreak = new Map();
 /** Per-symbol count of consecutive ticks refused for a frozen feed. */
 const staleStreak = new Map();
+
+/**
+ * Signals still waiting on a stop or a target.
+ *
+ * Held on disk, not just in memory: this process restarts constantly -- the
+ * supervisor, a sleeping machine, a chart reload -- and on 2026-09-07 it went
+ * down twice in the six hours between a signal firing and the user reading it.
+ * A follow-up that only survives while nothing goes wrong would be missing
+ * exactly when it is needed.
+ */
+const OPEN_FILE = join(DIR, 'open-signals.json');
+let openSignals = [];
+
+function loadOpenSignals() {
+  try {
+    if (!existsSync(OPEN_FILE)) return [];
+    const parsed = JSON.parse(readFileSync(OPEN_FILE, 'utf8'));
+    return Array.isArray(parsed) ? parsed : [];
+  } catch (err) {
+    console.log(`${stamp()}  /!\\ open-signals.json illisible (${err.message}) — suivi reparti a vide`);
+    return [];
+  }
+}
+
+function saveOpenSignals() {
+  try {
+    mkdirSync(DIR, { recursive: true });
+    writeFileSync(OPEN_FILE, JSON.stringify(openSignals, null, 2), 'utf8');
+  } catch (err) {
+    console.log(`${stamp()}  /!\\ ecriture de open-signals.json impossible : ${err.message}`);
+  }
+}
 /** Account balance from rules.json, for the levels quoted in an alert. */
 let ACCOUNT = 100;
 
@@ -220,7 +255,12 @@ async function readSymbol(symbol, timeframe) {
     throw new Error(`releve ecarte : le graphique a change pendant la lecture — ${describeMismatch(after, symbol, timeframe)}`);
   }
 
-  return { cur, ctx: { signalMa, smcDirection, smcInternal } };
+  // The newest bar travels with the reading: excursions want the high and low
+  // the trade actually saw, not the close the tick happened to land on.
+  const b = bars[bars.length - 1];
+  const lastBar = b ? { high: b.high, low: b.low, time: b.time } : null;
+
+  return { cur, lastBar, ctx: { signalMa, smcDirection, smcInternal } };
 }
 
 function describe(symbol, cur, verdicts, ctx = {}) {
@@ -288,6 +328,65 @@ function checkStructureReadable(symbol, ctx) {
       sendTelegram(`Surveillance retablie\n\n${msg}`).then(() => {});
     }
   }
+}
+
+/** Pip size and unit for an instrument, falling back to forex convention. */
+function contractOf(symbol) {
+  const key = symbol.replace(/^[A-Z]+:/, '').toUpperCase();
+  return CONTRACT[key] ?? { pip: 0.0001, label: 'pips' };
+}
+
+/**
+ * Advance every open signal on this symbol with the latest bar, and announce
+ * the ones that resolved.
+ *
+ * A signal is followed for at most 24 hours, and closed out when the forex week
+ * shuts. Both are the same judgement: a 15-minute setup that has neither
+ * stopped nor reached its target a day later has stopped being that setup, and
+ * carrying it further would report a number that no longer measures the trade.
+ */
+function followOpenSignals(symbol, cur, bar) {
+  if (!openSignals.length) return;
+  const { pip, label } = contractOf(symbol);
+  const dp = cur.price_decimals ?? 5;
+  const now = Date.now();
+  const still = [];
+
+  for (const raw of openSignals) {
+    if (!symbolMatches(raw.symbol, symbol) && !symbolMatches(symbol, raw.symbol)) {
+      still.push(raw);
+      continue;
+    }
+    let pos = bar ? updatePosition(raw, bar) : raw;
+
+    if (!pos.outcome) {
+      const ageH = (now - new Date(pos.at).getTime()) / 3_600_000;
+      if (weeklyClose()) pos = expirePosition(pos, 'market_closed');
+      else if (ageH >= 24) pos = expirePosition(pos, 'expired');
+    }
+
+    if (!pos.outcome) { still.push(pos); continue; }
+
+    const text = formatOutcome(pos, { price: cur.price, pip, label, decimals: dp });
+    console.log('\n' + text.split('\n').map(l => '  ' + l).join('\n') + '\n');
+    const { mfe, mae } = excursions(pos, pip);
+    logLine(`outcomes-${today()}.log`, {
+      at: new Date().toISOString(), symbol: pos.symbol, direction: pos.direction,
+      opened_at: pos.at, outcome: pos.outcome,
+      entry: pos.entry, stop: pos.stop, target: pos.target,
+      mfe, mae, price_at_close: cur.price, bars_seen: pos.bars_seen,
+    });
+    if (telegramConfigured()) {
+      sendTelegram(text).then(r => {
+        if (!r.ok) console.log(`${stamp()}  /!\\ Telegram non delivre : ${r.reason}`);
+      });
+    }
+  }
+
+  const changed = still.length !== openSignals.length
+    || still.some((p, i) => p !== openSignals[i]);
+  openSignals = still;
+  if (changed) saveOpenSignals();
 }
 
 /**
@@ -361,12 +460,24 @@ function announce(symbol, cur, hit) {
     stochastic: cur.stochastic, atr: cur.atr,
     relative_volume: cur.relative_volume, higher_timeframe: cur.higher_timeframe,
   });
+
+  // Start following it. Without levels there is nothing to follow -- an alert
+  // whose stop could not be computed is still worth sending, but it cannot be
+  // resolved later, so it is not tracked rather than tracked wrongly.
+  if (stop !== null && target !== null) {
+    openSignals.push(openPosition({
+      symbol, direction: hit.direction,
+      entry: cur.price, stop: Number(stop), target: Number(target),
+      atr: cur.atr?.value ?? null,
+    }));
+    saveOpenSignals();
+  }
 }
 
 async function tick(watchlist, timeframe) {
   for (const symbol of watchlist) {
     try {
-      const { cur, ctx } = await readSymbol(symbol, timeframe);
+      const { cur, lastBar, ctx } = await readSymbol(symbol, timeframe);
 
       // Modern standby freezes this process without killing it, so the
       // supervisor sees nothing to restart and the log simply resumes hours
@@ -407,6 +518,10 @@ async function tick(watchlist, timeframe) {
             last_bar_age_minutes: cur.last_bar_age_minutes ?? null, price: cur.price,
           });
         }
+        // No bar, so no excursion update -- but the close-out still has to run,
+        // or a signal open at the Friday close would sit unresolved all weekend
+        // waiting for a fresh tick that is not coming.
+        followOpenSignals(symbol, cur, null);
         continue;
       }
       const wasStale = staleStreak.get(symbol) ?? 0;
@@ -460,6 +575,10 @@ async function tick(watchlist, timeframe) {
         bullish: { filters: verdicts.bullish.filters, triggers: verdicts.bullish.triggers, blockedBy: verdicts.bullish.blockedBy },
       });
 
+      // Before announcing a new one: a signal that resolved on this very bar
+      // should be reported as resolved, not left open behind a fresh alert.
+      followOpenSignals(symbol, cur, lastBar);
+
       if (verdicts.signal) announce(symbol, cur, verdicts.signal);
     } catch (err) {
       console.log(`${stamp()}  ${symbol.padEnd(7)} erreur : ${err.message}`);
@@ -480,6 +599,16 @@ async function main() {
   console.log(`\n  Moniteur — ${watchlist.join(', ')} en ${timeframe} min, releve toutes les ${INTERVAL_MIN} min`);
   console.log(`  Journal : snapshots/monitor-${today()}.jsonl`);
   console.log(`  Telegram : ${telegramConfigured() ? 'configure' : 'non configure (alertes en fichier seulement)'}`);
+
+  // Reload before the first tick, so a restart mid-trade picks the follow-up
+  // back up instead of losing it.
+  openSignals = loadOpenSignals();
+  if (openSignals.length) {
+    console.log(`  Signaux suivis : ${openSignals.length} en cours`);
+    for (const p of openSignals) {
+      console.log(`    ${p.direction} ${p.symbol} entree ${p.entry} stop ${p.stop} objectif ${p.target} (${p.at})`);
+    }
+  }
   if (SWITCH && watchlist.length > 1) console.log('  Le chart changera de symbole a chaque releve (--no-switch pour l\'eviter).');
   console.log('  Ctrl+C pour arreter.\n');
 
