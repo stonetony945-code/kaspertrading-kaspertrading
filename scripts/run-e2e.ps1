@@ -11,11 +11,22 @@
 #
 #   .\run-e2e.ps1                 # deadline 20 min
 #   .\run-e2e.ps1 -TimeoutMin 30
+#   .\run-e2e.ps1 -RunOnceTask 'KasperTrading-E2E'   # unregister that task once it works
 #
 # Output lands in snapshots/e2e-<date>.log.
 
 param(
-    [int]$TimeoutMin = 20
+    [int]$TimeoutMin = 20,
+
+    # Name of the scheduled task to unregister after a run that actually
+    # completed. Lets the caller schedule this DAILY -- the only trigger type
+    # Windows will catch up on -- while still getting one-shot behaviour.
+    #
+    # A one-time trigger set for 2026-09-07 05:33 never fired: the machine was
+    # off, and an expired one-time trigger is simply dropped, StartWhenAvailable
+    # or not. A daily trigger that has missed its slot runs as soon as the
+    # machine is back, which is what was wanted all along.
+    [string]$RunOnceTask = ''
 )
 
 $ErrorActionPreference = 'Continue'
@@ -38,6 +49,22 @@ if (-not (Test-Path $node)) { Log "node introuvable a $node - abandon"; exit 1 }
 
 $TASK = 'KasperTrading-Monitor'
 $monitorWasRunning = $false
+$completed = $false
+
+# Half the suite asserts against live values, so a weekend run measures nothing
+# and would burn the one-shot. Forex is shut from Friday ~21:00 UTC to Sunday
+# ~21:00; leave the task in place and take tomorrow's slot instead.
+$utc = [DateTime]::UtcNow
+$closed = switch ($utc.DayOfWeek) {
+    'Saturday' { $true }
+    'Sunday'   { $utc.Hour -lt 21 }
+    'Friday'   { $utc.Hour -ge 21 }
+    default    { $false }
+}
+if ($closed) {
+    Log "Marche ferme ($($utc.DayOfWeek) $($utc.Hour)h UTC) - suite non lancee, tache conservee"
+    exit 0
+}
 
 try {
     $t = Get-ScheduledTask -TaskName $TASK -ErrorAction SilentlyContinue
@@ -77,6 +104,9 @@ try {
         Start-Sleep -Seconds 2
     } else {
         Log "Suite terminee (code $($p.ExitCode))"
+        # Completed, pass or fail. A failing suite is a result; a suite that
+        # never finished is not, and should get another slot tomorrow.
+        $completed = $true
     }
 
     foreach ($f in @($out, $err)) {
@@ -92,6 +122,16 @@ finally {
     if ($monitorWasRunning) {
         Log "Redemarrage du moniteur"
         try { Start-ScheduledTask -TaskName $TASK } catch { Log "echec du redemarrage : $($_.Exception.Message)" }
+    }
+
+    # Retire the daily task only once it has produced a result. A timeout or a
+    # crash leaves it registered, so the next morning retries by itself instead
+    # of needing someone to notice.
+    if ($RunOnceTask -and $completed) {
+        Log "Suite executee - retrait de la tache '$RunOnceTask'"
+        try { Unregister-ScheduledTask -TaskName $RunOnceTask -Confirm:$false } catch { Log "echec du retrait : $($_.Exception.Message)" }
+    } elseif ($RunOnceTask) {
+        Log "Suite non terminee - tache '$RunOnceTask' conservee pour demain"
     }
     Log "Termine"
 }
