@@ -66,6 +66,14 @@ if ($closed) {
     exit 0
 }
 
+# At most one attempt a day. On a logon/unlock trigger this script can fire many
+# times in an afternoon, and a run that keeps timing out would take the chart
+# away for its full deadline on every single unlock.
+if ((Get-Content $log -ErrorAction SilentlyContinue | Select-String -Pattern 'Lancement de la suite' -Quiet)) {
+    Log "Deja tente aujourd'hui - rien a faire"
+    exit 0
+}
+
 try {
     $t = Get-ScheduledTask -TaskName $TASK -ErrorAction SilentlyContinue
     if ($t -and $t.State -eq 'Running') {
