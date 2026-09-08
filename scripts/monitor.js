@@ -75,6 +75,17 @@ const htfHistory = new Map();
 const smcBlindStreak = new Map();
 /** Per-symbol count of consecutive ticks refused for a frozen feed. */
 const staleStreak = new Map();
+/**
+ * Whether the current monitoring hole has already been reported.
+ *
+ * The hole is measured against the last stored reading, and a reading is only
+ * stored when a tick succeeds -- so while the feed stays frozen every tick
+ * measures the same growing hole and announced it again. On 2026-09-08 that
+ * produced 33 "TROU DE n MIN" events in six hours, n climbing by five each
+ * time, for one single outage. Same fault as the stale-feed spam, one branch
+ * further up.
+ */
+const gapAnnounced = new Map();
 
 /**
  * Signals still waiting on a stop or a target.
@@ -493,7 +504,13 @@ async function tick(watchlist, timeframe) {
         const line = `${stamp()}  ${symbol.padEnd(7)} /!\\ TROU DE ${gapMin} MIN — aucune surveillance sur cette periode.`
           + ' Releve precedent ecarte, aucun croisement ne sera deduit par-dessus.';
         console.log(line);
-        logLine(`gaps-${today()}.log`, { at: new Date(now).toISOString(), symbol, gap_minutes: gapMin, since: new Date(stored.at).toISOString() });
+        // Once per hole. Its length is reported again when it closes, which is
+        // the number worth having anyway -- the running total mid-outage only
+        // says the outage is still going.
+        if (!gapAnnounced.get(symbol)) {
+          gapAnnounced.set(symbol, true);
+          logLine(`gaps-${today()}.log`, { at: new Date(now).toISOString(), symbol, gap_minutes: gapMin, since: new Date(stored.at).toISOString() });
+        }
       }
 
       // TradingView does not always resume its feed after the machine wakes:
@@ -530,9 +547,13 @@ async function tick(watchlist, timeframe) {
         staleStreak.set(symbol, 0);
         console.log(`${stamp()}  ${symbol.padEnd(7)} flux repris apres ${wasStale} releve(s) ecarte(s).`);
         logLine(`gaps-${today()}.log`, {
-          at: new Date(now).toISOString(), symbol, kind: 'feed_recovered', skipped_ticks: wasStale,
+          at: new Date(now).toISOString(), symbol, kind: 'feed_recovered',
+          skipped_ticks: wasStale, gap_minutes: gapMin,
         });
       }
+      // This tick got through, so the hole is closed: arm the announcement for
+      // the next one.
+      gapAnnounced.set(symbol, false);
 
       // Structure is one of the two triggers, and an unknown verdict never
       // counts as met — so with SMC off the chart the monitor is not merely
