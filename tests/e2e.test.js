@@ -40,6 +40,28 @@ async function evaluate(expr) {
   return result.value;
 }
 
+/**
+ * Poll until `check` returns something truthy, then return it; on timeout,
+ * return whatever was last seen so the caller's own assertion reports it.
+ *
+ * Every chart-changing assertion here was `set X`, `sleep(n)`, `assert` -- and
+ * n is a guess about how long TradingView takes. On 2026-09-08 the guess was
+ * wrong: chart_set_symbol failed with "changed to AAPL, got: FX:GBPUSD" against
+ * an API that worked perfectly, because 2500 ms happened not to be enough that
+ * morning. The same guess, made in the monitor and the snapshot script, is what
+ * src/core/chart-guard.js exists to remove.
+ */
+async function waitUntil(check, { timeoutMs = 12000, pollMs = 200 } = {}) {
+  const deadline = Date.now() + timeoutMs;
+  for (;;) {
+    let value;
+    try { value = await check(); } catch { value = undefined; }
+    if (value) return value;
+    if (Date.now() >= deadline) return value;
+    await sleep(pollMs);
+  }
+}
+
 async function apiExists(path) {
   try {
     return await evaluate(`(function() { try { return ${path} != null; } catch(e) { return false; } })()`);
@@ -200,12 +222,15 @@ describe('TradingView MCP — Full E2E (70 tools)', () => {
     });
 
     after(async () => {
+      // This block leaves the chart on AAPL, daily, line. Restoring it matters
+      // beyond tidiness: the monitor reads whatever is on screen, so a restore
+      // that silently did not finish hands it another instrument's bars.
       await evaluate(`${CHART_API}.setSymbol('${originalSymbol}')`);
-      await sleep(2000);
+      await waitUntil(async () => (await evaluate(`${CHART_API}.symbol()`)) === originalSymbol);
       await evaluate(`${CHART_API}.setResolution('${originalTF}')`);
-      await sleep(1000);
+      await waitUntil(async () => (await evaluate(`${CHART_API}.resolution()`)) === originalTF);
       await evaluate(`${CHART_API}.setChartType(${originalType})`);
-      await sleep(500);
+      await waitUntil(async () => (await evaluate(`${CHART_API}.chartType()`)) === originalType);
     });
 
     it('chart_get_state — symbol, timeframe, studies', async () => {
@@ -231,30 +256,38 @@ describe('TradingView MCP — Full E2E (70 tools)', () => {
 
     it('chart_set_symbol — change ticker', async () => {
       await evaluate(`${CHART_API}.setSymbol('AAPL', {})`);
-      await sleep(2500);
-      const sym = await evaluate(`${CHART_API}.symbol()`);
+      const sym = await waitUntil(async () => {
+        const s = await evaluate(`${CHART_API}.symbol()`);
+        return s && s.includes('AAPL') ? s : null;
+      }) ?? await evaluate(`${CHART_API}.symbol()`);
       assert.ok(sym.includes('AAPL'), `Symbol changed to AAPL, got: ${sym}`);
     });
 
     it('chart_set_timeframe — change resolution', async () => {
       await evaluate(`${CHART_API}.setResolution('D', {})`);
-      await sleep(1500);
-      const tf = await evaluate(`${CHART_API}.resolution()`);
+      const tf = await waitUntil(async () => {
+        const t = await evaluate(`${CHART_API}.resolution()`);
+        return t === '1D' ? t : null;
+      }) ?? await evaluate(`${CHART_API}.resolution()`);
       assert.equal(tf, '1D');
     });
 
     it('chart_set_type — change chart style', async () => {
       await evaluate(`${CHART_API}.setChartType(2)`); // Line
-      await sleep(500);
-      const ct = await evaluate(`${CHART_API}.chartType()`);
+      const ct = await waitUntil(async () => {
+        const c = await evaluate(`${CHART_API}.chartType()`);
+        return c === 2 ? c : null;
+      }) ?? await evaluate(`${CHART_API}.chartType()`);
       assert.equal(ct, 2, 'Chart type set to Line (2)');
     });
 
     it('chart_manage_indicator (add) — add Volume', async () => {
       const before = await evaluate(`${CHART_API}.getAllStudies().map(function(s) { return s.id; })`);
       await evaluate(`${CHART_API}.createStudy('Volume', false, false, [])`);
-      await sleep(1500);
-      const after = await evaluate(`${CHART_API}.getAllStudies().map(function(s) { return s.id; })`);
+      const after = await waitUntil(async () => {
+        const ids = await evaluate(`${CHART_API}.getAllStudies().map(function(s) { return s.id; })`);
+        return ids.some(id => !before.includes(id)) ? ids : null;
+      }) ?? await evaluate(`${CHART_API}.getAllStudies().map(function(s) { return s.id; })`);
       const newIds = after.filter(id => !before.includes(id));
       assert.ok(newIds.length > 0, 'Volume study added');
       // Clean up: remove it
@@ -266,16 +299,20 @@ describe('TradingView MCP — Full E2E (70 tools)', () => {
     it('chart_manage_indicator (remove) — add then remove', async () => {
       const before = await evaluate(`${CHART_API}.getAllStudies().map(function(s) { return s.id; })`);
       await evaluate(`${CHART_API}.createStudy('Volume', false, false, [])`);
-      await sleep(1500);
-      const after = await evaluate(`${CHART_API}.getAllStudies().map(function(s) { return s.id; })`);
+      const after = await waitUntil(async () => {
+        const ids = await evaluate(`${CHART_API}.getAllStudies().map(function(s) { return s.id; })`);
+        return ids.some(id => !before.includes(id)) ? ids : null;
+      }) ?? await evaluate(`${CHART_API}.getAllStudies().map(function(s) { return s.id; })`);
       const newIds = after.filter(id => !before.includes(id));
       assert.ok(newIds.length > 0, 'Study added');
 
       for (const id of newIds) {
         await evaluate(`${CHART_API}.removeEntity('${id}')`);
       }
-      await sleep(500);
-      const final = await evaluate(`${CHART_API}.getAllStudies().map(function(s) { return s.id; })`);
+      const final = await waitUntil(async () => {
+        const ids = await evaluate(`${CHART_API}.getAllStudies().map(function(s) { return s.id; })`);
+        return newIds.every(id => !ids.includes(id)) ? ids : null;
+      }) ?? await evaluate(`${CHART_API}.getAllStudies().map(function(s) { return s.id; })`);
       for (const id of newIds) {
         assert.ok(!final.includes(id), `Study ${id} removed`);
       }
