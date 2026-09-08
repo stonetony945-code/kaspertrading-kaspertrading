@@ -987,18 +987,31 @@ val = array.get(a, 5)`;
       `);
       if (!quote) return;
 
+      // createShape returns a Promise and the shape is absent from
+      // getAllShapes() until it settles. evaluate() does await promises -- but
+      // the old version returned { entity_id: id } from the IIFE, a plain
+      // object merely holding the Promise, so there was nothing for
+      // awaitPromise to wait on. The id serialised to {}, which is truthy, so
+      // this asserted success while nothing had been drawn; draw_list below
+      // then failed unless an unrelated shape happened to be on the chart.
+      // Returning the promise chain itself is what makes awaitPromise apply.
       const result = await evaluate(`
         (function() {
           var api = ${CHART_API};
-          var id = api.createShape(
+          var before = api.getAllShapes().map(function(s) { return s.id; });
+          return Promise.resolve(api.createShape(
             { time: ${quote.time}, price: ${quote.price} },
             { shape: 'horizontal_line', overrides: {} }
-          );
-          return { entity_id: id };
+          )).then(function() {
+            var after = api.getAllShapes().map(function(s) { return s.id; });
+            var created = after.filter(function(id) { return before.indexOf(id) === -1; });
+            return { entity_id: created[0] || null };
+          });
         })()
       `);
       assert.ok(result, 'Shape created');
       assert.ok(result.entity_id, 'Has entity_id');
+      assert.equal(typeof result.entity_id, 'string', 'entity_id is an id, not a Promise');
     });
 
     it('draw_list — list drawings', async () => {
@@ -1010,6 +1023,10 @@ val = array.get(a, 5)`;
       `);
       assert.ok(Array.isArray(shapes), 'Shapes is array');
       assert.ok(shapes.length > 0, 'Has at least one shape');
+      assert.ok(
+        shapes.some(s => s.name === 'horizontal_line'),
+        'the line drawn by the previous test is listed'
+      );
     });
 
     it('draw_get_properties — read shape details', async () => {

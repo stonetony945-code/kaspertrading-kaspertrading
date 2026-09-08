@@ -1,37 +1,53 @@
 /**
  * Core drawing logic.
  */
-import { evaluate, getChartApi } from '../connection.js';
+import { evaluate, evaluateAsync, getChartApi } from '../connection.js';
 
+/**
+ * createShape and createMultipointShape return a Promise, and the shape is not
+ * in getAllShapes() until it resolves -- an immediate read gives the count from
+ * before the call. This was papered over with a 200 ms sleep, which is the same
+ * guess as every other fixed delay in this codebase: right until it isn't.
+ *
+ * Awaiting the promise removes the guess. The e2e suite showed what the guess
+ * cost: draw_shape asserted on the returned value, got a Promise object, called
+ * it a success, and draw_list then found nothing -- passing only on runs where
+ * an unrelated shape happened to be on the chart.
+ */
 export async function drawShape({ shape, point, point2, overrides: overridesRaw, text }) {
   const overrides = overridesRaw ? (typeof overridesRaw === 'string' ? JSON.parse(overridesRaw) : overridesRaw) : {};
   const apiPath = await getChartApi();
   const overridesStr = JSON.stringify(overrides || {});
   const textStr = text ? JSON.stringify(text) : '""';
 
-  const before = await evaluate(`${apiPath}.getAllShapes().map(function(s) { return s.id; })`);
-
-  if (point2) {
-    await evaluate(`
-      ${apiPath}.createMultipointShape(
+  const create = point2
+    ? `${apiPath}.createMultipointShape(
         [{ time: ${point.time}, price: ${point.price} }, { time: ${point2.time}, price: ${point2.price} }],
         { shape: '${shape}', overrides: ${overridesStr}, text: ${textStr} }
-      )
-    `);
-  } else {
-    await evaluate(`
-      ${apiPath}.createShape(
+      )`
+    : `${apiPath}.createShape(
         { time: ${point.time}, price: ${point.price} },
         { shape: '${shape}', overrides: ${overridesStr}, text: ${textStr} }
-      )
-    `);
-  }
+      )`;
 
-  await new Promise(r => setTimeout(r, 200));
-  const after = await evaluate(`${apiPath}.getAllShapes().map(function(s) { return s.id; })`);
-  const newId = (after || []).find(id => !(before || []).includes(id)) || null;
-  const result = { entity_id: newId };
-  return { success: true, shape, entity_id: result?.entity_id };
+  // The whole sequence runs in the page, so the before-snapshot, the await and
+  // the after-snapshot cannot be separated by another caller's drawing.
+  const result = await evaluateAsync(`
+    (function() {
+      var api = ${apiPath};
+      var before = api.getAllShapes().map(function(s) { return s.id; });
+      return Promise.resolve(${create}).then(function() {
+        var after = api.getAllShapes().map(function(s) { return s.id; });
+        var created = after.filter(function(id) { return before.indexOf(id) === -1; });
+        return { entity_id: created.length ? created[0] : null, count: after.length };
+      });
+    })()
+  `);
+
+  if (!result?.entity_id) {
+    throw new Error(`la forme '${shape}' n'a pas ete creee (${result?.count ?? '?'} formes sur le graphique)`);
+  }
+  return { success: true, shape, entity_id: result.entity_id };
 }
 
 export async function listDrawings() {
