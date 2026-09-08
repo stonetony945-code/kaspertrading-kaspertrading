@@ -36,7 +36,7 @@ import { sendTelegram, telegramConfigured, formatSignal } from '../src/core/noti
 import { sizePosition, targetDistance, CONTRACT } from '../src/core/position.js';
 import { awaitChart, symbolMatches, resolutionMatches, describeMismatch } from '../src/core/chart-guard.js';
 import {
-  openPosition, updatePosition, expirePosition, formatOutcome, excursions,
+  openPosition, catchUpPosition, expirePosition, formatOutcome, excursions,
 } from '../src/core/signal-tracker.js';
 
 const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..');
@@ -255,12 +255,12 @@ async function readSymbol(symbol, timeframe) {
     throw new Error(`releve ecarte : le graphique a change pendant la lecture — ${describeMismatch(after, symbol, timeframe)}`);
   }
 
-  // The newest bar travels with the reading: excursions want the high and low
-  // the trade actually saw, not the close the tick happened to land on.
-  const b = bars[bars.length - 1];
-  const lastBar = b ? { high: b.high, low: b.low, time: b.time } : null;
+  // The bars travel with the reading: excursions want the highs and lows the
+  // trade actually saw, not the close each tick happened to land on -- and the
+  // whole window, not just the newest bar, so a gap can be replayed.
+  const window = bars.map(b => ({ high: b.high, low: b.low, time: b.time }));
 
-  return { cur, lastBar, ctx: { signalMa, smcDirection, smcInternal } };
+  return { cur, bars: window, ctx: { signalMa, smcDirection, smcInternal } };
 }
 
 function describe(symbol, cur, verdicts, ctx = {}) {
@@ -345,7 +345,7 @@ function contractOf(symbol) {
  * stopped nor reached its target a day later has stopped being that setup, and
  * carrying it further would report a number that no longer measures the trade.
  */
-function followOpenSignals(symbol, cur, bar) {
+function followOpenSignals(symbol, cur, bars) {
   if (!openSignals.length) return;
   const { pip, label } = contractOf(symbol);
   const dp = cur.price_decimals ?? 5;
@@ -357,7 +357,7 @@ function followOpenSignals(symbol, cur, bar) {
       still.push(raw);
       continue;
     }
-    let pos = bar ? updatePosition(raw, bar) : raw;
+    let pos = bars ? catchUpPosition(raw, bars) : raw;
 
     if (!pos.outcome) {
       const ageH = (now - new Date(pos.at).getTime()) / 3_600_000;
@@ -406,7 +406,7 @@ function notifyDesktop(title, message) {
   } catch { /* the file log is the source of truth */ }
 }
 
-function announce(symbol, cur, hit) {
+function announce(symbol, cur, hit, entryBarTime = null) {
   const lines = [
     '',
     '  ' + '='.repeat(70),
@@ -469,6 +469,7 @@ function announce(symbol, cur, hit) {
       symbol, direction: hit.direction,
       entry: cur.price, stop: Number(stop), target: Number(target),
       atr: cur.atr?.value ?? null,
+      barTime: entryBarTime,
     }));
     saveOpenSignals();
   }
@@ -477,7 +478,7 @@ function announce(symbol, cur, hit) {
 async function tick(watchlist, timeframe) {
   for (const symbol of watchlist) {
     try {
-      const { cur, lastBar, ctx } = await readSymbol(symbol, timeframe);
+      const { cur, bars, ctx } = await readSymbol(symbol, timeframe);
 
       // Modern standby freezes this process without killing it, so the
       // supervisor sees nothing to restart and the log simply resumes hours
@@ -577,9 +578,9 @@ async function tick(watchlist, timeframe) {
 
       // Before announcing a new one: a signal that resolved on this very bar
       // should be reported as resolved, not left open behind a fresh alert.
-      followOpenSignals(symbol, cur, lastBar);
+      followOpenSignals(symbol, cur, bars);
 
-      if (verdicts.signal) announce(symbol, cur, verdicts.signal);
+      if (verdicts.signal) announce(symbol, cur, verdicts.signal, bars.at(-1)?.time ?? null);
     } catch (err) {
       console.log(`${stamp()}  ${symbol.padEnd(7)} erreur : ${err.message}`);
     }

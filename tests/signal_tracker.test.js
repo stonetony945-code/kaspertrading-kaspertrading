@@ -1,7 +1,8 @@
 import { test, describe } from 'node:test';
 import assert from 'node:assert/strict';
 import {
-  openPosition, updatePosition, expirePosition, excursions, unrealised, formatOutcome,
+  openPosition, updatePosition, catchUpPosition, expirePosition,
+  excursions, unrealised, formatOutcome,
 } from '../src/core/signal-tracker.js';
 
 /** The real signal of 2026-09-07 12:16, entry 1.35296, ATR 4.72 pips. */
@@ -87,6 +88,78 @@ describe('updatePosition — short', () => {
     let q = short();
     q = updatePosition(q, { high: 1.35050, low: 1.34650 });
     assert.equal(q.outcome, 'target');
+  });
+});
+
+describe('catchUpPosition', () => {
+  const bar = (time, high, low) => ({ time, high, low });
+
+  test('replays the bars missed while the monitor was down', () => {
+    // The real failure: the monitor lost 634 minutes on the night of
+    // 2026-09-07 while price reached 1.35529, clearing a target at 1.35485.
+    // Folding only the newest bar on waking would never have seen it.
+    const p = openPosition({
+      symbol: 'GBPUSD', direction: 'bullish',
+      entry: 1.35296, stop: 1.35202, target: 1.35485, barTime: 1000,
+    });
+    const overnight = [
+      bar(1900, 1.35400, 1.35300),
+      bar(2800, 1.35529, 1.35420),   // the bar that cleared the target
+      bar(3700, 1.35340, 1.35263),
+    ];
+    const after = catchUpPosition(p, overnight);
+    assert.equal(after.outcome, 'target');
+    assert.equal(after.high, 1.35529);
+  });
+
+  test('stops at the bar that resolved it, not the newest', () => {
+    const p = openPosition({
+      symbol: 'GBPUSD', direction: 'bullish',
+      entry: 1.353, stop: 1.352, target: 1.354, barTime: 1000,
+    });
+    const after = catchUpPosition(p, [
+      bar(1900, 1.3541, 1.3530),   // target
+      bar(2800, 1.3600, 1.3500),   // later, wilder — must not count
+    ]);
+    assert.equal(after.outcome, 'target');
+    assert.equal(after.high, 1.3541);
+    assert.equal(after.last_bar_time, 1900);
+  });
+
+  test('skips bars at or before the entry bar', () => {
+    // The entry bar's range includes prices from before the signal fired.
+    const p = openPosition({
+      symbol: 'GBPUSD', direction: 'bullish',
+      entry: 1.353, stop: 1.352, target: 1.354, barTime: 2000,
+    });
+    const after = catchUpPosition(p, [
+      bar(1000, 1.3600, 1.3500),   // long before entry
+      bar(2000, 1.3545, 1.3510),   // the entry bar itself
+    ]);
+    assert.equal(after.outcome, null);
+    assert.equal(after.bars_seen, 0);
+  });
+
+  test('does not re-count bars already folded in', () => {
+    const p = openPosition({
+      symbol: 'GBPUSD', direction: 'bullish',
+      entry: 1.353, stop: 1.352, target: 1.360, barTime: 1000,
+    });
+    const bars = [bar(1900, 1.3540, 1.3525), bar(2800, 1.3550, 1.3535)];
+    const once = catchUpPosition(p, bars);
+    const twice = catchUpPosition(once, bars);
+    assert.equal(once.bars_seen, 2);
+    assert.equal(twice.bars_seen, 2);
+  });
+
+  test('a position with no bar time yet folds everything it is given', () => {
+    const p = openPosition({
+      symbol: 'GBPUSD', direction: 'bullish',
+      entry: 1.353, stop: 1.352, target: 1.360,
+    });
+    const after = catchUpPosition(p, [bar(1900, 1.3555, 1.3528)]);
+    assert.equal(after.bars_seen, 1);
+    assert.equal(after.high, 1.3555);
   });
 });
 

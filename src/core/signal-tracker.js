@@ -13,7 +13,7 @@
  */
 
 /** A signal, the moment it fires. Entry, stop and target are prices. */
-export function openPosition({ symbol, direction, entry, stop, target, at, atr = null }) {
+export function openPosition({ symbol, direction, entry, stop, target, at, atr = null, barTime = null }) {
   if (!symbol || !direction) throw new Error('symbol et direction requis');
   for (const [name, v] of [['entry', entry], ['stop', stop], ['target', target]]) {
     if (!Number.isFinite(v)) throw new Error(`${name} doit etre un nombre`);
@@ -25,7 +25,34 @@ export function openPosition({ symbol, direction, entry, stop, target, at, atr =
     outcome: null,                // 'target' | 'stop' | 'expired' | 'both'
     resolved_at: null,
     bars_seen: 0,
+    // Newest bar already accounted for. The entry bar itself is excluded: its
+    // high and low include prices from before the signal fired, and resolving a
+    // position on them would credit or blame it for a move it never saw.
+    last_bar_time: barTime,
   };
+}
+
+/**
+ * Fold every bar that arrived since the last one seen.
+ *
+ * The per-tick version only ever looked at the newest bar, which is correct
+ * exactly as long as the monitor never misses one. It missed 634 minutes on
+ * the night of 2026-09-07: the price reached 1.35529 overnight and cleared a
+ * tracked target at 1.35485, and on waking the tracker resumed from the current
+ * bar, never saw it, and would have reported the signal unresolved.
+ *
+ * Bars are fetched 300 at a time anyway, so replaying the gap costs nothing.
+ */
+export function catchUpPosition(pos, bars) {
+  if (pos.outcome || !Array.isArray(bars)) return pos;
+  let next = pos;
+  for (const bar of bars) {
+    if (!bar || !Number.isFinite(bar.time)) continue;
+    if (next.last_bar_time !== null && bar.time <= next.last_bar_time) continue;
+    next = updatePosition(next, bar);
+    if (next.outcome) break;   // stop at the bar that resolved it, not the newest
+  }
+  return next;
 }
 
 /**
@@ -36,7 +63,7 @@ export function openPosition({ symbol, direction, entry, stop, target, at, atr =
  * intrabar order, so claiming the target came first would be inventing the
  * favourable half of an ambiguity.
  */
-export function updatePosition(pos, { high, low }) {
+export function updatePosition(pos, { high, low, time = null }) {
   if (pos.outcome) return pos;
   const h = Number.isFinite(high) ? high : pos.high;
   const l = Number.isFinite(low) ? low : pos.low;
@@ -46,6 +73,7 @@ export function updatePosition(pos, { high, low }) {
     high: Math.max(pos.high, h),
     low: Math.min(pos.low, l),
     bars_seen: pos.bars_seen + 1,
+    last_bar_time: Number.isFinite(time) ? time : (pos.last_bar_time ?? null),
   };
 
   const long = pos.direction !== 'bearish';
