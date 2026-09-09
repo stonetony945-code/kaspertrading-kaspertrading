@@ -75,6 +75,24 @@ const htfHistory = new Map();
 const smcBlindStreak = new Map();
 /** Per-symbol count of consecutive ticks refused for a frozen feed. */
 const staleStreak = new Map();
+
+/**
+ * Consecutive frozen ticks after which the whole application is presumed stuck.
+ *
+ * TradingView does not always resume its feed when the machine wakes: CDP
+ * answers, every API call works, and the bars simply stop advancing. Nothing in
+ * the chain recovers from that. launch-tv.ps1 is a no-op while CDP is
+ * listening, so the supervisor relaunches a monitor that reconnects to the same
+ * dead page and refuses ticks for as long as it takes someone to notice -- on
+ * 2026-09-09 that was twice in one day, both times fixed by killing the
+ * application by hand.
+ *
+ * Six ticks is thirty minutes at the default interval: long enough not to fire
+ * on a slow reconnect, short enough to lose only half an hour of a session.
+ */
+const STALE_RESTART_TICKS = 6;
+/** Set when the feed looks dead enough to warrant restarting TradingView. */
+let restartRequested = false;
 /**
  * Whether the current monitoring hole has already been reported.
  *
@@ -542,6 +560,18 @@ async function tick(watchlist, timeframe) {
             last_bar_age_minutes: cur.last_bar_age_minutes ?? null, price: cur.price,
           });
         }
+        // A feed frozen this long is not going to thaw on its own. Ask the
+        // supervisor for a fresh TradingView -- but never during the weekly
+        // close, where a still feed is simply a shut market and restarting the
+        // application every half hour all weekend would be the wrong reflex.
+        if (streak + 1 >= STALE_RESTART_TICKS && !closed && !restartRequested) {
+          restartRequested = true;
+          console.log(`${stamp()}  ${symbol.padEnd(7)} /!\\ ${streak + 1} releves geles d'affilee — demande de relance de TradingView.`);
+          logLine(`gaps-${today()}.log`, {
+            at: new Date(now).toISOString(), symbol, kind: 'restart_requested',
+            stale_ticks: streak + 1, last_bar_age_minutes: cur.last_bar_age_minutes ?? null,
+          });
+        }
         // No bar, so no excursion update -- but the close-out still has to run,
         // or a signal open at the Friday close would sit unresolved all weekend
         // waiting for a fresh tick that is not coming.
@@ -649,23 +679,33 @@ async function main() {
       await tick(watchlist, timeframe);
     }
     if (ONCE) break;
+    // Exiting is how the monitor asks for a new TradingView: it cannot kill the
+    // application itself without owning process management the supervisor
+    // already owns, and the supervisor is the one that relaunches.
+    if (restartRequested) {
+      console.log(`${stamp()}  Arret volontaire pour laisser le superviseur relancer TradingView.`);
+      break;
+    }
     await sleep(INTERVAL_MIN * 60_000);
   }
 }
 
+/** 3 tells the supervisor the feed is dead and TradingView needs killing. */
+const EXIT_STALE_FEED = 3;
+
 let stopping = false;
-async function shutdown() {
+async function shutdown(code = 0) {
   if (stopping) return;
   stopping = true;
   console.log('\n  Arret du moniteur.');
   try { await disconnect(); } catch { /* ignore */ }
-  process.exit(0);
+  process.exit(code);
 }
-process.on('SIGINT', shutdown);
-process.on('SIGTERM', shutdown);
+process.on('SIGINT', () => shutdown(0));
+process.on('SIGTERM', () => shutdown(0));
 
 main()
-  .then(() => shutdown())
+  .then(() => shutdown(restartRequested ? EXIT_STALE_FEED : 0))
   .catch(async (err) => {
     console.error(`Erreur fatale : ${err.message}`);
     try { await disconnect(); } catch { /* ignore */ }

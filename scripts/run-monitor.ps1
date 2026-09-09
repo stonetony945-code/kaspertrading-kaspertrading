@@ -41,7 +41,26 @@ if (Test-Path (Join-Path $nodeDir 'node.exe')) { $env:Path = "$env:Path;$nodeDir
 Log "Superviseur demarre - $Symbol, releve toutes les $Interval min"
 
 $failures = 0
+# Captured explicitly rather than read from $LASTEXITCODE at the top of the next
+# iteration: that variable is global and survives only as long as nothing else
+# in between touches it, which is a property no one should have to maintain.
+$lastExit = 0
 while ($true) {
+    # Exit code 3 means the monitor saw the feed frozen for half an hour. CDP is
+    # answering and every API call works -- the bars have simply stopped -- so
+    # launch-tv.ps1 would do nothing, and the fresh monitor would reconnect to
+    # the same dead page. The application has to go. This happened twice on
+    # 2026-09-09 and both times needed a human to notice and kill it by hand.
+    if ($lastExit -eq 3) {
+        Log "Flux gele signale par le moniteur - arret de TradingView"
+        try {
+            Get-Process -Name 'TradingView' -ErrorAction SilentlyContinue | Stop-Process -Force
+            Start-Sleep -Seconds 5
+        } catch {
+            Log "Impossible d'arreter TradingView : $($_.Exception.Message)"
+        }
+    }
+
     # TradingView may have been closed since the last iteration; launch-tv.ps1
     # is a no-op when CDP is already listening.
     try {
@@ -79,8 +98,10 @@ while ($true) {
     try {
         & node (Join-Path $root 'scripts\monitor.js') '--symbols' $Symbol '--interval' $Interval 2>&1 |
             ForEach-Object { Log $_ }
-        Log "Le moniteur s'est termine (code $LASTEXITCODE)"
+        $lastExit = $LASTEXITCODE
+        Log "Le moniteur s'est termine (code $lastExit)"
     } catch {
+        $lastExit = -1
         Log "Le moniteur a plante : $($_.Exception.Message)"
     }
 
