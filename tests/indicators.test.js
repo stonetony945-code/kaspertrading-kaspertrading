@@ -9,7 +9,7 @@
 
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
-import { stochastic, atr, fairValueGaps, volumeProfile, inferDecimals, summarise } from '../src/core/derived-indicators.js';
+import { stochastic, atr, fairValueGaps, volumeProfile, inferDecimals, summarise, higherTimeframeTrend } from '../src/core/derived-indicators.js';
 
 const bar = (high, low, close, volume = 100, time = 0) => ({ high, low, close, volume, time, open: close });
 
@@ -235,6 +235,39 @@ describe('summarise', () => {
     const out = summarise(bars, { include: new Set(['fvg']) });
     assert.equal(out.stale, true, 'a 50-minute-old bar on a 15m chart is stale');
     assert.equal(out.stale_limit_minutes, 45);
+  });
+
+  it('records how far price sits from the 1h EMA, not just which side', () => {
+    // 2026-09-09: a buy signal cleared its trend filter by 0.6 pip, the trend
+    // flipped inside the hour, and the trade never traded above its entry. The
+    // direction alone cannot tell that apart from a price 12 pips clear.
+    const now = Math.floor(Date.now() / 1000);
+    // 300 rising 15-min bars: aggregated to 1h, price ends well above its EMA.
+    const bars = Array.from({ length: 300 }, (_, i) => {
+      const c = 1.3500 + i * 0.00002;
+      return { time: now - (300 - i) * 900, open: c, high: c + 0.0001, low: c - 0.0001, close: c, volume: 1000 };
+    });
+
+    const h = higherTimeframeTrend(bars);
+    assert.ok(h, 'trend computed');
+    assert.equal(h.distance, h.price - h.ema, 'distance is the signed gap to the EMA');
+    assert.ok(h.distance > 0, 'a rising series ends above its own average');
+    assert.equal(h.above, h.distance > 0, 'sign of the distance agrees with above_ema');
+
+    const out = summarise(bars, { include: new Set(['atr', 'htf']) });
+    assert.ok(Number.isFinite(out.higher_timeframe.distance));
+    assert.ok(out.higher_timeframe.distance_atr > 0, 'also expressed against ATR');
+  });
+
+  it('leaves distance_atr null when ATR was not requested', () => {
+    const now = Math.floor(Date.now() / 1000);
+    const bars = Array.from({ length: 300 }, (_, i) => {
+      const c = 1.3500 + i * 0.00002;
+      return { time: now - (300 - i) * 900, open: c, high: c + 0.0001, low: c - 0.0001, close: c, volume: 1000 };
+    });
+    const out = summarise(bars, { include: new Set(['htf']) });
+    assert.equal(out.higher_timeframe.distance_atr, null);
+    assert.ok(Number.isFinite(out.higher_timeframe.distance), 'the raw gap is still there');
   });
 
   it('does not flag a bar that is merely late', () => {

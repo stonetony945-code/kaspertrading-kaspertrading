@@ -293,9 +293,15 @@ function describe(symbol, cur, verdicts, ctx = {}) {
   // fire. Say so on the line itself: a blind monitor must not resemble a quiet
   // market.
   const blind = ctx.smcDirection ? '' : '  /!\\ SMC illisible — aucun signal possible';
+  // The gap to the 1h EMA, beside the direction it produced. A 'bullish' worth
+  // 0.6 pip and one worth 12 read identically without it.
+  const { pip, label } = contractOf(symbol);
+  const gap = Number.isFinite(h.distance)
+    ? `(${h.distance >= 0 ? '+' : ''}${(h.distance / pip).toFixed(1)}${label === 'pips' ? 'p' : 'pt'})`
+    : '';
   return `${stamp()}  ${symbol.padEnd(7)} ${String(cur.price).padEnd(11)}`
     + ` K${s.k ?? '—'}/D${s.d ?? '—'}`
-    + `  ATR ${a.state ?? '—'}  vol ${v.state ?? '—'}  1h ${h.direction ?? '—'}`
+    + `  ATR ${a.state ?? '—'}  vol ${v.state ?? '—'}  1h ${h.direction ?? '—'}${gap}`
     + `  ${gate}${blind}`;
 }
 

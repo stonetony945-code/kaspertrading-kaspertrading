@@ -181,12 +181,19 @@ export function summarise(bars, { include, options = {} } = {}) {
       seconds: options.htf_seconds || 3600,
       period: options.htf_period || 20,
     });
+    // Expressed against ATR as well as in price units: 3 pips means something
+    // different in a quiet market than in a fast one, and the comparison that
+    // will eventually be worth making is "how far, relative to how much this
+    // pair is moving", not "how far in absolute terms".
+    const atrValue = out.atr?.value ?? null;
     out.higher_timeframe = h && {
       timeframe: `${(options.htf_seconds || 3600) / 60}min`,
       ema: round(h.ema, dp),
       price: round(h.price, dp),
       above_ema: h.above,
       direction: h.direction,
+      distance: round(h.distance, dp),
+      distance_atr: atrValue > 0 ? round(Math.abs(h.distance) / atrValue, 2) : null,
       bars: h.bars,
       note: 'EMA computed from aggregated bars, not the LuxAlgo Signal MA.',
     };
@@ -300,6 +307,14 @@ export function higherTimeframeTrend(bars, { seconds = 3600, period = 20 } = {})
     ema: last,
     price,
     above: price > last,
+    // Signed gap to the average, positive above. The direction only carries the
+    // sign of this, and a price sitting on the EMA crosses it every bar while
+    // reporting a perfectly confident 'bullish' or 'bearish'. On 2026-09-09 a
+    // buy signal passed its trend filter by 0.6 pip, the trend flipped within
+    // the hour, and the trade never traded above its entry. Recording the
+    // distance is what makes it possible to find out later whether the narrow
+    // ones lose more often than the wide ones -- one case proves nothing.
+    distance: price - last,
     slope,
     direction: slope > 0 && price > last ? 'bullish' : slope < 0 && price < last ? 'bearish' : 'mixed',
   };
